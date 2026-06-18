@@ -1,0 +1,4 @@
+# Development/test dependencies for aviary_directory_import.
+# Install with:  pip install -r requirements-dev.txt
+pytest>=7.0
+requests>=2.25

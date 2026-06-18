@@ -100,6 +100,16 @@ AVIARY_PLATFORM_HOST = "https://www.aviaryplatform.com/"
 # wait plus ret/backoff keeps a bulk run from tripping the limiter.
 WAIT_SECONDS = 1.0
 
+# (connect, read) timeouts in seconds for Aviary API calls. Without a timeout
+# a single stalled connection blocks the whole bulk run forever; the read
+# value bounds how long we wait for the server to start responding.
+HTTP_TIMEOUT = (30, 300)
+
+# The presigned media upload streams a possibly very large file to storage.
+# The read value here is the allowed gap between byte chunks, not the total
+# upload time, so a generous value tolerates slow links without hanging.
+UPLOAD_TIMEOUT = (30, 600)
+
 # Aviary transcodes uploaded media asynchronously; an index cannot be attached
 # until the media file finishes processing. These bound how long to wait.
 MEDIA_READY_TIMEOUT = 600.0    # max seconds to wait for one media file
@@ -433,7 +443,8 @@ class AviaryClient:
         url = self._url("api/v1/collections")
         for page_number in range(1, max_pages + 1):
             params = {"page_size": page_size, "page_number": page_number}
-            response = requests.get(url, headers=self._headers(), params=params)
+            response = requests.get(url, headers=self._headers(), params=params,
+                                    timeout=HTTP_TIMEOUT)
             self._pace()
             payload = self._safe_json(response)
             if self._has_error(payload):
@@ -477,7 +488,7 @@ class AviaryClient:
             return "DRY-RUN-COLLECTION-ID"
         # files={} forces requests to send a multipart/form-data body.
         response = requests.post(url, headers=self._headers(), data=data,
-                                 files={})
+                                 files={}, timeout=HTTP_TIMEOUT)
         self._pace()
         payload = self._require_ok(response, "Collection create")
         collection_id = self._extract_id(payload)
@@ -507,7 +518,8 @@ class AviaryClient:
                   f"title={title!r} access={access!r} "
                   f"description={description[:60]!r}...")
             return "DRY-RUN-RESOURCE-ID"
-        response = requests.post(url, headers=self._headers(), json=data)
+        response = requests.post(url, headers=self._headers(), json=data,
+                                 timeout=HTTP_TIMEOUT)
         self._pace()
         payload = self._require_ok(response, "Resource create")
         resource_id = self._extract_id(payload)
@@ -526,7 +538,8 @@ class AviaryClient:
         if self.dry_run:
             print(f"      [dry-run] PUT {url}  access={access!r}")
             return
-        response = requests.put(url, headers=self._headers(), json=data)
+        response = requests.put(url, headers=self._headers(), json=data,
+                                timeout=HTTP_TIMEOUT)
         self._pace()
         self._require_ok(response, "Resource access update")
 
@@ -566,7 +579,8 @@ class AviaryClient:
         # Step 1: request the presigned upload slot.
         files = {"media_file": "presigned"}
         response = requests.post(url, headers=self._headers(),
-                                 params=params, files=files)
+                                 params=params, files=files,
+                                 timeout=HTTP_TIMEOUT)
         self._pace()
         payload = self._require_ok(response, "Media create")
         try:
@@ -575,25 +589,28 @@ class AviaryClient:
         except (KeyError, TypeError):
             raise RuntimeError(f"Unexpected media create response: {payload}")
 
-        # Step 2: PUT the bytes to the presigned (storage) URL. Use a clean
-        # header set so the bearer token is not sent to the storage backend.
-        with open(os.path.abspath(file_path), "rb") as fh:
-            file_data = fh.read()
+        # Step 2: PUT the bytes to the presigned (storage) URL. Stream straight
+        # from the file handle rather than reading it all into memory, since a
+        # media file can be many gigabytes. Use a clean header set so the bearer
+        # token is not sent to the storage backend.
         put_headers = {"Content-Type": "application/octet-stream"}
-        put_resp = requests.put(presigned_url, headers=put_headers,
-                                data=file_data)
+        with open(os.path.abspath(file_path), "rb") as fh:
+            put_resp = requests.put(presigned_url, headers=put_headers,
+                                    data=fh, timeout=UPLOAD_TIMEOUT)
         put_resp.raise_for_status()
 
         # Step 3: tell Aviary the upload is complete.
         complete_url = self._url(f"api/v1/media_files/{media_id}/complete")
-        requests.get(complete_url, headers=self._headers())
+        requests.get(complete_url, headers=self._headers(),
+                     timeout=HTTP_TIMEOUT)
         self._pace()
         return media_id
 
     def get_media_file(self, media_id):
         """GET a media file record (used to check processing status)."""
         url = self._url(f"api/v1/media_files/{media_id}")
-        response = requests.get(url, headers=self._headers())
+        response = requests.get(url, headers=self._headers(),
+                                timeout=HTTP_TIMEOUT)
         self._pace()
         return self._safe_json(response)
 
@@ -616,7 +633,8 @@ class AviaryClient:
         # processing not reported: fall back to other positive signals.
         if data.get("transcode_url"):
             return True
-        duration = (data.get("duration") or "").strip()
+        # duration may arrive as a string or a number; coerce before stripping.
+        duration = str(data.get("duration") or "").strip()
         if duration and duration not in ("00:00:00", "00:00:00.000", "0"):
             return True
         return False
@@ -670,7 +688,8 @@ class AviaryClient:
             files = {"marc_xml_file":
                      (os.path.basename(marc_xml_path), fh, "application/xml")}
             response = requests.post(url, headers=self._headers(),
-                                     data=data, files=files)
+                                     data=data, files=files,
+                                     timeout=HTTP_TIMEOUT)
         self._pace()
         payload = self._require_ok(response, "MARC import create")
         import_id = self._extract_id(payload)
@@ -681,7 +700,8 @@ class AviaryClient:
     def get_import(self, import_id):
         """GET an import job record."""
         url = self._url(f"api/v1/imports/{import_id}")
-        response = requests.get(url, headers=self._headers())
+        response = requests.get(url, headers=self._headers(),
+                                timeout=HTTP_TIMEOUT)
         self._pace()
         return self._safe_json(response)
 
@@ -733,7 +753,8 @@ class AviaryClient:
         ids = set()
         for page_number in range(1, max_pages + 1):
             params = {"page_size": page_size, "page_number": page_number}
-            response = requests.get(url, headers=self._headers(), params=params)
+            response = requests.get(url, headers=self._headers(), params=params,
+                                    timeout=HTTP_TIMEOUT)
             self._pace()
             payload = self._safe_json(response)
             items = payload.get("data") if isinstance(payload, dict) else None
@@ -809,7 +830,8 @@ class AviaryClient:
         with open(index_file, "rb") as fh:
             files = {"associated_file": (os.path.basename(index_file), fh, file_type)}
             response = requests.post(url, headers=self._headers(),
-                                     data=data, files=files)
+                                     data=data, files=files,
+                                     timeout=HTTP_TIMEOUT)
         self._pace()
         payload = self._require_ok(response, "Index create")
         index_id = self._extract_id(payload)
