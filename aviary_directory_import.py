@@ -17,8 +17,19 @@ What the script does
 3. Reuses the Aviary collection titled ``MPS Upload {today's date}`` if one
    already exists in the organization; otherwise creates it with
    ``is_public = false`` and ``is_featured = true``.
-4. For each resource directory creates one Aviary resource. If project.prop
-   has an ``alephID``, the resource is built from the Harvard HOLLIS MARC XML
+4. For each resource directory creates one Aviary resource. By default the
+   resource is built from the project.prop metadata mapping:
+       title       <- project.prop "title" (falls back to "shelfnum", then
+                      the directory name, if "title" is NULL/blank)
+       description <- project.prop "metsLabel"
+       access      <- project.prop "access"
+       plus additional metadata fields (Description/Agent/Date/Format/Subject/
+       Identifier with per-field vocabularies) mapped from project.prop fields
+       such as abstract, creator, composer, performer, subject, date, genre,
+       alephID, findingAid, etc. (see RESOURCE_METADATA_MAP /
+       build_resource_metadata).
+   If the optional ``--importMarc`` flag is given AND project.prop has a usable
+   ``alephID``, the resource is instead built from the Harvard HOLLIS MARC XML
    record:
      a. The alephID is normalized to a HOLLIS id. It may be supplied as 9, 17,
         or 18 digits. A 17- or 18-digit value is used as-is; a 9-digit value
@@ -37,21 +48,20 @@ What the script does
         and waits for the new resource to appear, then forces the project.prop
         access mapping onto it (PUT /api/v1/resources/{id}).
    Only once the import has completed and the resource is in hand does media
-   import proceed. If ``alephID`` is NULL (or the MARC fetch/import fails) the
-   script falls back to the project.prop metadata mapping:
-       title       <- project.prop "title" (falls back to "shelfnum", then
-                      the directory name, if "title" is NULL/blank)
-       description <- project.prop "metsLabel"
-       access      <- project.prop "access"
+   import proceed. If ``--importMarc`` is not given, or ``alephID`` is NULL, or
+   the MARC fetch/import fails, the project.prop metadata mapping above is used.
 5. Imports one Aviary media file for every ``.mp3`` / ``.mp4`` / ``.mov`` found
    anywhere
    under that resource's ``deliverable`` subdirectory, sorted alphanumerically
    by filename. Each media file is created with
        access = true, is_downloadable = false, is_360 = false.
 6. Imports one Aviary index for every ``*playlist.xml`` file found in the
-   ``deliverable/playlists`` subdirectory, sorted alphanumerically by filename.
-   Index N is linked (via ``resource_file_id``) to media file N in the same
-   sorted position. Each index is created with
+   ``deliverable/playlists`` subdirectory. Each index is linked (via
+   ``resource_file_id``) to the media file whose filename (without extension)
+   equals the playlist's ``<dc:identifier>`` value -- e.g. a playlist with
+   ``<dc:identifier>T-529_0006_DM_01_01_{...}</dc:identifier>`` links to the
+   media file ``T-529_0006_DM_01_01_{...}.mp3``. An index with no matching
+   media file is skipped with a warning. Each index is created with
        is_public = true, language = en, title = filename without extension.
 
 The HTTP request patterns (resource create, presigned media upload, index
@@ -65,13 +75,21 @@ Usage
 -----
     export AVIARY_TOKEN="your_api_key"
 
+    # Default: build every resource from the project.prop metadata mapping.
     python3 aviary_directory_import.py /path/to/top_level_directory
-    python3 aviary_directory_import.py /path/to/dir --dry-run   # preview only
+
+    # Opt in to building resources from Harvard HOLLIS MARC XML (when a usable
+    # alephID is present), falling back to the metadata mapping on failure.
+    python3 aviary_directory_import.py /path/to/dir --importMarc
+
+    # Preview the planned API calls without contacting Aviary.
+    python3 aviary_directory_import.py /path/to/dir --dry-run
 
 Run ``python3 aviary_directory_import.py --help`` for all options.
 """
 
 import argparse
+import csv
 import datetime
 import mimetypes
 import os
@@ -80,6 +98,7 @@ import shutil
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 
 import requests
 
@@ -99,6 +118,18 @@ AVIARY_PLATFORM_HOST = "https://www.aviaryplatform.com/"
 # Polite delay (seconds) between API calls. AVP rate-limits the API; a small
 # wait plus ret/backoff keeps a bulk run from tripping the limiter.
 WAIT_SECONDS = 1.0
+
+# (connect, read) timeouts for HTTP calls so a stalled server can't hang the
+# run. UPLOAD_TIMEOUT is used for the small multipart uploads (MARC XML import,
+# index file). The large media PUT to presigned storage uses NO client-side
+# timeout (matching AVP's bulk-import script), since a read timeout was cutting
+# off multi-GB transfers mid-upload.
+HTTP_TIMEOUT = (30, 300)
+UPLOAD_TIMEOUT = (30, 3600)
+
+# Retry/backoff for media and index creation (transient network/server errors).
+RETRY_ATTEMPTS = 3       # total attempts per operation
+RETRY_BACKOFF = 2.0      # base seconds; delay grows as RETRY_BACKOFF * 2**(n-1)
 
 # Aviary transcodes uploaded media asynchronously; an index cannot be attached
 # until the media file finishes processing. These bound how long to wait.
@@ -227,6 +258,65 @@ def map_access_status(raw_value):
     return ACCESS_STATUS_MAP.get(raw_value.strip().lower(), ACCESS_DEFAULT)
 
 
+# project.prop field -> (Aviary metadata field, vocabulary) for the metadata
+# mapping used when creating a resource. Order is preserved in the output.
+# "metsLabel" is handled separately (Description with no vocabulary).
+RESOURCE_METADATA_MAP = [
+    ("abstract", "Description", "Abstract"),
+    ("actor", "Agent", "Actor"),
+    ("adapter", "Agent", "Adapter"),
+    ("arranger", "Agent", "Arranger"),
+    ("commentator", "Agent", "Commentator"),
+    ("composer", "Agent", "Composer"),
+    ("creator", "Agent", "Creator"),
+    ("date", "Date", ""),
+    ("director", "Agent", "Director"),
+    ("genre", "Format", ""),
+    ("instrumentalist", "Agent", "Instrumentalist"),
+    ("interviewee", "Agent", "Interviewee"),
+    ("interviewer", "Agent", "Interviewer"),
+    ("librettist", "Agent", "Librettist"),
+    ("lyricist", "Agent", "Lyricist"),
+    ("moderator", "Agent", "Moderator"),
+    ("musicaldirector", "Agent", "Musical Director"),
+    ("musician", "Agent", "Musician"),
+    ("narrator", "Agent", "Narrator"),
+    ("performer", "Agent", "Performer"),
+    ("publisher", "Agent", "Publisher"),
+    ("singer", "Agent", "Singer"),
+    ("speaker", "Agent", "Speaker"),
+    ("storyteller", "Agent", "Storyteller"),
+    ("subject", "Subject", ""),
+    ("vocalist", "Agent", "Vocalist"),
+    ("alephID", "Identifier", "alephID"),
+    ("findingAid", "Identifier", "findingAid"),
+    ("shelfnum", "Identifier", "shelfnum"),
+    ("depositnumber", "Identifier", "depositnumber"),
+    ("collectionname", "Relation", "is part of"),
+]
+
+
+def build_resource_metadata(props):
+    """Build the Aviary resource metadata dict from project.prop fields.
+
+    Returns a dict mapping each Aviary metadata field (Description, Agent,
+    Date, Format, Subject, Identifier) to a list of {vocabulary, value}
+    entries. Fields whose project.prop value is NULL/blank are skipped.
+    """
+    metadata = {}
+
+    def add(field, vocabulary, value):
+        if not is_null_value(value):
+            metadata.setdefault(field, []).append(
+                {"vocabulary": vocabulary, "value": value.strip()})
+
+    # metsLabel maps to Description with no vocabulary (the original mapping).
+    add("Description", "", props.get("metsLabel"))
+    for prop_key, field, vocabulary in RESOURCE_METADATA_MAP:
+        add(field, vocabulary, props.get(prop_key))
+    return metadata
+
+
 def resolve_base_url(aviary_org, override=None):
     """Derive the Aviary API base URL from the project.prop ``aviaryOrg`` value.
 
@@ -340,13 +430,65 @@ def find_index_files(deliverable_dir):
     return sorted(matches, key=lambda p: os.path.basename(p).lower())
 
 
+def parse_playlist_identifiers(xml_path):
+    """Return the <dc:identifier> values from a playlist XML file.
+
+    Namespace-agnostic: matches any element whose local tag name is
+    "identifier" (e.g. dc:identifier). Returns a list of stripped strings; an
+    unparseable file yields an empty list.
+    """
+    identifiers = []
+    try:
+        tree = ET.parse(xml_path)
+    except (ET.ParseError, OSError):
+        return identifiers
+    for elem in tree.iter():
+        tag = elem.tag.rsplit("}", 1)[-1] if isinstance(elem.tag, str) else ""
+        if tag == "identifier" and elem.text and elem.text.strip():
+            identifiers.append(elem.text.strip())
+    return identifiers
+
+
+def media_match_key(media_path):
+    """The key used to match a media file to a playlist's dc:identifier:
+    the filename without its extension."""
+    return os.path.splitext(os.path.basename(media_path))[0]
+
+
+def parse_dmart_email_success(resource_dir):
+    """Return the <emailSuccess> text from a dmart.conf in the resource dir.
+
+    Looks for dmart.conf at the resource directory root, then anywhere beneath
+    it. Returns "" if not found or unparseable.
+    """
+    conf_path = os.path.join(resource_dir, "dmart.conf")
+    if not os.path.isfile(conf_path):
+        conf_path = None
+        for root, _dirs, files in os.walk(resource_dir):
+            if "dmart.conf" in files:
+                conf_path = os.path.join(root, "dmart.conf")
+                break
+    if not conf_path:
+        return ""
+    try:
+        tree = ET.parse(conf_path)
+    except (ET.ParseError, OSError):
+        return ""
+    for elem in tree.iter():
+        tag = elem.tag.rsplit("}", 1)[-1] if isinstance(elem.tag, str) else ""
+        if tag == "emailSuccess" and elem.text and elem.text.strip():
+            return elem.text.strip()
+    return ""
+
+
 # --------------------------------------------------------------------------- #
 # Aviary API client
 # --------------------------------------------------------------------------- #
 
 class AviaryClient:
     def __init__(self, base_url, token, organization_id, wait=WAIT_SECONDS,
-                 dry_run=False):
+                 dry_run=False, retry_attempts=RETRY_ATTEMPTS,
+                 retry_backoff=RETRY_BACKOFF):
         # Guarantee exactly one trailing slash on the base URL.
         self.base_url = base_url.rstrip("/") + "/"
         self.token = token
@@ -355,6 +497,8 @@ class AviaryClient:
         self.organization_id = str(organization_id)
         self.wait = wait
         self.dry_run = dry_run
+        self.retry_attempts = max(1, int(retry_attempts))
+        self.retry_backoff = retry_backoff
 
     # -- helpers ----------------------------------------------------------- #
 
@@ -370,6 +514,27 @@ class AviaryClient:
     def _pace(self):
         if self.wait:
             time.sleep(self.wait)
+
+    def _with_retries(self, what, func):
+        """Call func() with retries and exponential backoff.
+
+        Retries transient network errors (timeouts, connection drops) and
+        server-side failures up to retry_attempts times, then re-raises the
+        last exception so the caller's per-item handler can log it.
+        """
+        last_exc = None
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                return func()
+            except (requests.exceptions.RequestException, RuntimeError) as exc:
+                last_exc = exc
+                if attempt >= self.retry_attempts:
+                    break
+                delay = self.retry_backoff * (2 ** (attempt - 1))
+                print(f"      {what} attempt {attempt} failed ({exc}); "
+                      f"retrying in {delay:.0f}s")
+                time.sleep(delay)
+        raise last_exc
 
     @staticmethod
     def _extract_id(payload):
@@ -433,7 +598,8 @@ class AviaryClient:
         url = self._url("api/v1/collections")
         for page_number in range(1, max_pages + 1):
             params = {"page_size": page_size, "page_number": page_number}
-            response = requests.get(url, headers=self._headers(), params=params)
+            response = requests.get(url, headers=self._headers(), params=params,
+                                    timeout=HTTP_TIMEOUT)
             self._pace()
             payload = self._safe_json(response)
             if self._has_error(payload):
@@ -477,7 +643,7 @@ class AviaryClient:
             return "DRY-RUN-COLLECTION-ID"
         # files={} forces requests to send a multipart/form-data body.
         response = requests.post(url, headers=self._headers(), data=data,
-                                 files={})
+                                 files={}, timeout=HTTP_TIMEOUT)
         self._pace()
         payload = self._require_ok(response, "Collection create")
         collection_id = self._extract_id(payload)
@@ -490,24 +656,28 @@ class AviaryClient:
     # -- resources --------------------------------------------------------- #
 
     def create_resource(self, collection_id, resource_user_key, title,
-                         description, access):
-        """Create a resource and return its id."""
+                         metadata, access):
+        """Create a resource and return its id.
+
+        metadata is the Aviary metadata dict (field -> list of
+        {vocabulary, value}), built from project.prop by
+        build_resource_metadata().
+        """
         url = self._url("api/v1/resources")
         data = {
             "resource_user_key": resource_user_key,
             "collection_id": collection_id,
             "title": title,
             "access": access,
-            "metadata": {
-                "Description": [{"vocabulary": "", "value": description}],
-            },
+            "metadata": metadata,
         }
         if self.dry_run:
+            fields = ", ".join(f"{k}({len(v)})" for k, v in metadata.items())
             print(f"    [dry-run] POST {url}  "
-                  f"title={title!r} access={access!r} "
-                  f"description={description[:60]!r}...")
+                  f"title={title!r} access={access!r} metadata=[{fields}]")
             return "DRY-RUN-RESOURCE-ID"
-        response = requests.post(url, headers=self._headers(), json=data)
+        response = requests.post(url, headers=self._headers(), json=data,
+                                 timeout=HTTP_TIMEOUT)
         self._pace()
         payload = self._require_ok(response, "Resource create")
         resource_id = self._extract_id(payload)
@@ -526,9 +696,34 @@ class AviaryClient:
         if self.dry_run:
             print(f"      [dry-run] PUT {url}  access={access!r}")
             return
-        response = requests.put(url, headers=self._headers(), json=data)
+        response = requests.put(url, headers=self._headers(), json=data,
+                                timeout=HTTP_TIMEOUT)
         self._pace()
         self._require_ok(response, "Resource access update")
+
+    def get_resource_direct_url(self, resource_id):
+        """Return a resource's direct_url via GET /api/v1/resources/{id}.
+
+        Returns "" if it can't be determined. The field appears on the resource
+        object (and under data.update in some responses).
+        """
+        if self.dry_run:
+            return f"https://example.aviaryplatform.com/r/{resource_id}"
+        url = self._url(f"api/v1/resources/{resource_id}")
+        try:
+            response = requests.get(url, headers=self._headers(),
+                                    timeout=HTTP_TIMEOUT)
+            self._pace()
+            payload = self._safe_json(response)
+        except requests.exceptions.RequestException:
+            return ""
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, list):
+            data = data[0] if data else None
+        for candidate in (data, (data or {}).get("update") if isinstance(data, dict) else None):
+            if isinstance(candidate, dict) and candidate.get("direct_url"):
+                return candidate["direct_url"]
+        return ""
 
     # -- media files ------------------------------------------------------- #
 
@@ -566,7 +761,8 @@ class AviaryClient:
         # Step 1: request the presigned upload slot.
         files = {"media_file": "presigned"}
         response = requests.post(url, headers=self._headers(),
-                                 params=params, files=files)
+                                 params=params, files=files,
+                                 timeout=HTTP_TIMEOUT)
         self._pace()
         payload = self._require_ok(response, "Media create")
         try:
@@ -575,25 +771,34 @@ class AviaryClient:
         except (KeyError, TypeError):
             raise RuntimeError(f"Unexpected media create response: {payload}")
 
-        # Step 2: PUT the bytes to the presigned (storage) URL. Use a clean
-        # header set so the bearer token is not sent to the storage backend.
+        # Step 2: PUT the bytes to the presigned (storage) URL using the same
+        # method as AVP's bulk-import script: the whole file in memory, the
+        # bearer auth header with Content-Type "text/plain", and NO client-side
+        # timeout. A read timeout was cutting off large (multi-GB) uploads
+        # mid-transfer; the official script omits the timeout and succeeds.
         with open(os.path.abspath(file_path), "rb") as fh:
             file_data = fh.read()
-        put_headers = {"Content-Type": "application/octet-stream"}
-        put_resp = requests.put(presigned_url, headers=put_headers,
+        size_mb = len(file_data) / (1024 * 1024)
+        print(f"        uploading {filename} ({size_mb:.1f} MB)...")
+        upload_headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "text/plain",
+        }
+        put_resp = requests.put(presigned_url, headers=upload_headers,
                                 data=file_data)
         put_resp.raise_for_status()
 
         # Step 3: tell Aviary the upload is complete.
         complete_url = self._url(f"api/v1/media_files/{media_id}/complete")
-        requests.get(complete_url, headers=self._headers())
+        requests.get(complete_url, headers=self._headers(), timeout=HTTP_TIMEOUT)
         self._pace()
         return media_id
 
     def get_media_file(self, media_id):
         """GET a media file record (used to check processing status)."""
         url = self._url(f"api/v1/media_files/{media_id}")
-        response = requests.get(url, headers=self._headers())
+        response = requests.get(url, headers=self._headers(),
+                                timeout=HTTP_TIMEOUT)
         self._pace()
         return self._safe_json(response)
 
@@ -616,7 +821,9 @@ class AviaryClient:
         # processing not reported: fall back to other positive signals.
         if data.get("transcode_url"):
             return True
-        duration = (data.get("duration") or "").strip()
+        # Coerce to str first: the API may return a numeric duration, and
+        # calling .strip() on a number would raise AttributeError.
+        duration = str(data.get("duration") or "").strip()
         if duration and duration not in ("00:00:00", "00:00:00.000", "0"):
             return True
         return False
@@ -670,7 +877,8 @@ class AviaryClient:
             files = {"marc_xml_file":
                      (os.path.basename(marc_xml_path), fh, "application/xml")}
             response = requests.post(url, headers=self._headers(),
-                                     data=data, files=files)
+                                     data=data, files=files,
+                                     timeout=UPLOAD_TIMEOUT)
         self._pace()
         payload = self._require_ok(response, "MARC import create")
         import_id = self._extract_id(payload)
@@ -681,7 +889,8 @@ class AviaryClient:
     def get_import(self, import_id):
         """GET an import job record."""
         url = self._url(f"api/v1/imports/{import_id}")
-        response = requests.get(url, headers=self._headers())
+        response = requests.get(url, headers=self._headers(),
+                                timeout=HTTP_TIMEOUT)
         self._pace()
         return self._safe_json(response)
 
@@ -733,7 +942,8 @@ class AviaryClient:
         ids = set()
         for page_number in range(1, max_pages + 1):
             params = {"page_size": page_size, "page_number": page_number}
-            response = requests.get(url, headers=self._headers(), params=params)
+            response = requests.get(url, headers=self._headers(), params=params,
+                                    timeout=HTTP_TIMEOUT)
             self._pace()
             payload = self._safe_json(response)
             items = payload.get("data") if isinstance(payload, dict) else None
@@ -809,7 +1019,8 @@ class AviaryClient:
         with open(index_file, "rb") as fh:
             files = {"associated_file": (os.path.basename(index_file), fh, file_type)}
             response = requests.post(url, headers=self._headers(),
-                                     data=data, files=files)
+                                     data=data, files=files,
+                                     timeout=UPLOAD_TIMEOUT)
         self._pace()
         payload = self._require_ok(response, "Index create")
         index_id = self._extract_id(payload)
@@ -930,36 +1141,57 @@ def process_resource_directory(client, collection_id, resource_dir, args,
 
     counts = {"resource": 0, "media": 0, "indexes": 0}
 
-    # Resource creation: if alephID is present, build the resource from the
-    # Harvard HOLLIS MARC XML record; otherwise (or on any MARC failure) fall
-    # back to the project.prop metadata mapping.
-    aleph_raw = props.get("alephID")
-    hollis_id = normalize_aleph_id(aleph_raw)
+    # Build the CSV log row for this resource (main() fills #media/#indexes
+    # from counts and writes it). Success/URL are updated as we go.
+    counts["log_row"] = {
+        "date": datetime.datetime.now().isoformat(timespec="seconds"),
+        "title": title,
+        "aviaryOrg": props.get("aviaryOrg", "").strip(),
+        "ownercode": props.get("ownercode", "").strip(),
+        "depositnumber": props.get("depositnumber", "").strip(),
+        "shelfnum": props.get("shelfnum", "").strip(),
+        "Success": "Failure",
+        "#media": 0,
+        "#indexes": 0,
+        "URL": "",
+        "emailSuccess": parse_dmart_email_success(resource_dir),
+    }
+    log_row = counts["log_row"]
+
+    # Resource creation. By default the resource is built from the project.prop
+    # metadata mapping. Only when --importMarc is passed AND project.prop has a
+    # usable alephID is the resource built from the Harvard HOLLIS MARC XML
+    # record (falling back to the metadata mapping on any MARC failure).
     resource_id = None
-    if hollis_id:
-        print(f"    alephID     : {aleph_raw!r} -> HOLLIS {hollis_id}")
-        resource_id = create_resource_via_marc(
-            client, collection_id, hollis_id,
-            job_title=f"MARC import {hollis_id} ({name})",
-            work_dir=work_dir,
-            timeout=args.marc_import_timeout,
-            interval=args.marc_import_interval,
-            resource_appear_timeout=args.resource_appear_timeout,
-        )
-        if resource_id is None:
-            print("    Falling back to project.prop metadata mapping.")
+    if args.import_marc:
+        aleph_raw = props.get("alephID")
+        hollis_id = normalize_aleph_id(aleph_raw)
+        if hollis_id:
+            print(f"    alephID     : {aleph_raw!r} -> HOLLIS {hollis_id}")
+            resource_id = create_resource_via_marc(
+                client, collection_id, hollis_id,
+                job_title=f"MARC import {hollis_id} ({name})",
+                work_dir=work_dir,
+                timeout=args.marc_import_timeout,
+                interval=args.marc_import_interval,
+                resource_appear_timeout=args.resource_appear_timeout,
+            )
+            if resource_id is None:
+                print("    Falling back to project.prop metadata mapping.")
+            else:
+                # The MARC import sets its own default access, so force the
+                # project.prop access mapping onto the new resource.
+                try:
+                    client.update_resource_access(resource_id, access)
+                    print(f"      forced access on MARC resource -> {access}")
+                except Exception as exc:
+                    print(f"      WARNING: could not set access on resource "
+                          f"{resource_id}: {exc}")
+        elif not is_null_value(aleph_raw):
+            print(f"    alephID     : {aleph_raw!r} (could not normalize to a "
+                  f"9-, 17-, or 18-digit id; using metadata mapping)")
         else:
-            # The MARC import sets its own default access, so force the
-            # project.prop access mapping onto the new resource.
-            try:
-                client.update_resource_access(resource_id, access)
-                print(f"      forced access on MARC resource -> {access}")
-            except Exception as exc:
-                print(f"      WARNING: could not set access on resource "
-                      f"{resource_id}: {exc}")
-    elif not is_null_value(aleph_raw):
-        print(f"    alephID     : {aleph_raw!r} (could not normalize to a "
-              f"9-, 17-, or 18-digit id; using metadata mapping)")
+            print("    alephID     : NULL; using metadata mapping")
 
     if resource_id is None:
         try:
@@ -967,13 +1199,14 @@ def process_resource_directory(client, collection_id, resource_dir, args,
                 collection_id=collection_id,
                 resource_user_key=resource_user_key,
                 title=title,
-                description=description,
+                metadata=build_resource_metadata(props),
                 access=access,
             )
         except Exception as exc:
             print(f"    ERROR creating resource: {exc}")
             return counts
     counts["resource"] = 1
+    log_row["URL"] = client.get_resource_direct_url(resource_id)
     print(f"    -> resource id: {resource_id}")
 
     # Locate the deliverable directory for this resource.
@@ -986,30 +1219,43 @@ def process_resource_directory(client, collection_id, resource_dir, args,
     index_files = find_index_files(deliverable_dir)
     print(f"    media files : {len(media_files)} | index files: {len(index_files)}")
 
-    # Upload media files in alphanumeric order; capture ids positionally.
-    # A failed upload stores None so index<->media positional alignment holds.
-    media_ids = []
+    # Upload media files in alphanumeric order (this sets their Aviary
+    # sort_order). Map each uploaded media's filename stem -> its id so indexes
+    # can be matched to media by the playlist's <dc:identifier>.
+    media_id_by_key = {}
     for sort_order, media_path in enumerate(media_files, start=1):
         print(f"      media[{sort_order}] {os.path.basename(media_path)}")
         try:
-            media_id = client.upload_media_file(media_path, resource_id,
-                                                sort_order)
-            media_ids.append(media_id)
+            media_id = client._with_retries(
+                f"media upload '{os.path.basename(media_path)}'",
+                lambda mp=media_path, so=sort_order: client.upload_media_file(
+                    mp, resource_id, so))
+            media_id_by_key[media_match_key(media_path)] = media_id
             counts["media"] += 1
         except Exception as exc:
             print(f"      ERROR uploading media "
                   f"'{os.path.basename(media_path)}': {exc}")
-            media_ids.append(None)
 
-    # Create indexes, linking index N to media N (same sorted position).
-    for position, index_path in enumerate(index_files):
-        if position >= len(media_ids) or media_ids[position] is None:
-            print(f"      WARNING: index '{os.path.basename(index_path)}' has no "
-                  f"media file at position {position + 1}; skipping.")
+    # Match each index to a media file by the playlist's <dc:identifier>, which
+    # equals the media filename without its extension.
+    for index_path in index_files:
+        index_name = os.path.basename(index_path)
+        identifiers = parse_playlist_identifiers(index_path)
+        media_id = None
+        matched_key = None
+        for ident in identifiers:
+            if ident in media_id_by_key:
+                media_id = media_id_by_key[ident]
+                matched_key = ident
+                break
+        if media_id is None:
+            detail = (f"dc:identifier {identifiers}" if identifiers
+                      else "no <dc:identifier> found")
+            print(f"      WARNING: index '{index_name}' has no matching media "
+                  f"file ({detail}); skipping.")
             continue
-        media_id = media_ids[position]
-        print(f"      index[{position + 1}] {os.path.basename(index_path)} "
-              f"-> media id {media_id}")
+        print(f"      index '{index_name}' -> media '{matched_key}' "
+              f"(id {media_id})")
         # An index can't attach while the media file is still transcoding, so
         # wait for it to finish processing first.
         if not client.wait_for_media_ready(media_id, media_ready_timeout,
@@ -1019,11 +1265,12 @@ def process_resource_directory(client, collection_id, resource_dir, args,
         else:
             print(f"      media id {media_id} ready; creating index")
         try:
-            client.create_index(index_path, media_id)
+            client._with_retries(
+                f"index create '{index_name}'",
+                lambda ip=index_path, mid=media_id: client.create_index(ip, mid))
             counts["indexes"] += 1
         except Exception as exc:
-            print(f"      ERROR creating index "
-                  f"'{os.path.basename(index_path)}': {exc}")
+            print(f"      ERROR creating index '{index_name}': {exc}")
 
     return counts
 
@@ -1078,6 +1325,24 @@ def parse_args(argv=None):
         help="Max seconds to wait for a MARC-imported resource to appear in "
              f"the collection (default {RESOURCE_APPEAR_TIMEOUT}).")
     parser.add_argument(
+        "--retry-attempts", type=int, default=RETRY_ATTEMPTS,
+        help="Total attempts for each media upload / index create "
+             f"(default {RETRY_ATTEMPTS}).")
+    parser.add_argument(
+        "--retry-backoff", type=float, default=RETRY_BACKOFF,
+        help="Base seconds for exponential backoff between retries "
+             f"(default {RETRY_BACKOFF}).")
+    parser.add_argument(
+        "--importMarc", dest="import_marc", action="store_true",
+        help="Build each resource from its Harvard HOLLIS MARC XML record when "
+             "project.prop has a usable alephID (falling back to the metadata "
+             "mapping on failure). Without this flag, resources are always "
+             "built from the project.prop metadata mapping.")
+    parser.add_argument(
+        "--log-file", default="mps_aviary_import_log.csv",
+        help="CSV log file; one row is appended per resource directory "
+             "(default mps_aviary_import_log.csv in the current directory).")
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Scan and print the planned API calls without contacting Aviary.")
     return parser.parse_args(argv)
@@ -1123,6 +1388,8 @@ def main(argv=None):
         organization_id=organization_id,
         wait=args.wait,
         dry_run=args.dry_run,
+        retry_attempts=args.retry_attempts,
+        retry_backoff=args.retry_backoff,
     )
 
     print("\n--- Resolving collection ---")
@@ -1139,19 +1406,42 @@ def main(argv=None):
         )
         print(f"    -> collection id: {collection_id}")
 
+    log_fields = ["date", "title", "aviaryOrg", "ownercode", "depositnumber",
+                  "shelfnum", "Success", "#media", "#indexes", "URL",
+                  "emailSuccess"]
+    log_path = os.path.abspath(args.log_file)
+    write_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
+
     work_dir = tempfile.mkdtemp(prefix="aviary_marc_")
     totals = {"resource": 0, "media": 0, "indexes": 0}
     try:
-        for resource_dir in resource_dirs:
-            try:
-                counts = process_resource_directory(
-                    client, collection_id, resource_dir, args, work_dir)
-                for k in totals:
-                    totals[k] += counts.get(k, 0)
-            except Exception as exc:  # keep going through the rest of the batch
-                print(f"    ERROR processing {resource_dir}: {exc}")
+        with open(log_path, "a", newline="", encoding="utf-8") as log_fh:
+            log_writer = csv.DictWriter(log_fh, fieldnames=log_fields)
+            if write_header:
+                log_writer.writeheader()
+            for resource_dir in resource_dirs:
+                try:
+                    counts = process_resource_directory(
+                        client, collection_id, resource_dir, args, work_dir)
+                    for k in totals:
+                        totals[k] += counts.get(k, 0)
+                    log_row = counts.get("log_row")
+                    if log_row is not None:
+                        log_row["#media"] = counts.get("media", 0)
+                        log_row["#indexes"] = counts.get("indexes", 0)
+                        # Success only if the resource was created AND at least
+                        # one media file was imported successfully.
+                        log_row["Success"] = (
+                            "Success" if counts.get("resource") and
+                            counts.get("media", 0) > 0 else "Failure")
+                        log_writer.writerow(log_row)
+                        log_fh.flush()
+                except Exception as exc:  # keep going through the rest of the batch
+                    print(f"    ERROR processing {resource_dir}: {exc}")
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+
+    print(f"\n    Log written to: {log_path}")
 
     print("\n=== Summary ===")
     print(f"    Collection : {collection_title} (id {collection_id})")
