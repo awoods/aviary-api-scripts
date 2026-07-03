@@ -1,0 +1,21 @@
+[project]
+name = "avp-mps-aviary-import"
+version = "0.1.0"
+description = "Bulk-import Harvard MPS deposit directories into the Aviary platform, optionally minting persistent NRS URNs."
+readme = "README.md"
+
+# urn-minter requires Python >=3.13, so this project does too.
+requires-python = ">=3.13"
+
+dependencies = [
+    "requests>=2.31.0",
+    "urn-minter>=1.0.1",
+]
+
+# Pull urn-minter from the HUIT Artifactory lts-python index rather than PyPI.
+[[tool.uv.index]]
+name = "huit-artifactory"
+url = "https://artifactory.huit.harvard.edu/artifactory/api/pypi/lts-python/simple"
+
+[tool.uv.sources]
+urn-minter = { index = "huit-artifactory" }

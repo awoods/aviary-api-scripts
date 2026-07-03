@@ -1,0 +1,22 @@
+# Secrets / local config
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# uv
+uv.lock
+
+# Import run output
+mps_aviary_import_log.csv
+
+# vi/vim temp, backup, and swap files
+*~
+*.bak
+*.swp
+*.swo
+.*.swp
+.*.swo
