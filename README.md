@@ -49,17 +49,41 @@ Media uploads and index creation are retried with exponential backoff on
 transient errors, and each resource directory's outcome is appended as a row to
 a CSV log (default `mps_aviary_import_log.csv`).
 
+With the optional `--mint-urns` flag, after each resource is created the script
+mints a persistent [NRS](https://nrs.harvard.edu) URN that resolves to the
+resource's Aviary URL (via the `urn-minter` library) and records it in the log's
+`URN` column. See [Minting persistent URNs](#minting-persistent-urns-optional).
+
 The HTTP request patterns mirror AVP's own published bulk-import scripts
 (<https://github.com/WeAreAVP/aviary-api-scripts>).
 
 ## Requirements
 
-- Python 3
-- The [`requests`](https://pypi.org/project/requests/) library:
-  ```bash
-  pip install requests
-  ```
+- Python ≥ 3.13
+- [`uv`](https://docs.astral.sh/uv/) for dependency management
+  (`brew install uv`, or see the uv install docs).
 - An Aviary API key/token.
+- For `--mint-urns` only: NRS/Apigee credentials (see
+  [Minting persistent URNs](#minting-persistent-urns-optional)).
+
+## Setup
+
+Dependencies are declared in `pyproject.toml` (`requests` and, for URN minting,
+`urn-minter`). Install them into a project virtualenv with:
+
+```bash
+uv sync
+```
+
+`urn-minter` is pulled from HUIT Artifactory's `lts-python` index (configured in
+`pyproject.toml`). Read access to that index is restricted to the Harvard VPN,
+so connect to the VPN before running `uv sync`.
+
+Run the script through uv so it uses that environment:
+
+```bash
+uv run aviary_directory_import.py ...
+```
 
 ## Usage
 
@@ -67,16 +91,19 @@ The HTTP request patterns mirror AVP's own published bulk-import scripts
 export AVIARY_TOKEN="your_api_key"
 
 # Preview the planned API calls without contacting Aviary (recommended first):
-python3 aviary_directory_import.py /path/to/top_level_directory --dry-run
+uv run aviary_directory_import.py /path/to/top_level_directory --dry-run
 
 # Run the import for real:
-python3 aviary_directory_import.py /path/to/top_level_directory
+uv run aviary_directory_import.py /path/to/top_level_directory
 
 # Build resources from Harvard HOLLIS MARC XML where a usable alephID exists:
-python3 aviary_directory_import.py /path/to/top_level_directory --importMarc
+uv run aviary_directory_import.py /path/to/top_level_directory --importMarc
+
+# Mint a persistent NRS URN for each resource (requires .env; see below):
+uv run aviary_directory_import.py /path/to/top_level_directory --mint-urns
 ```
 
-Run `python3 aviary_directory_import.py --help` for all options.
+Run `uv run aviary_directory_import.py --help` for all options.
 
 ### Common options
 
@@ -84,6 +111,8 @@ Run `python3 aviary_directory_import.py --help` for all options.
 | --- | --- |
 | `--dry-run` | Scan and print the planned API calls without contacting Aviary. |
 | `--importMarc` | Build resources from Harvard HOLLIS MARC XML when a usable `alephID` is present (default: always use the `project.prop` metadata mapping). |
+| `--mint-urns` | Mint a persistent NRS URN per resource and record it in the log's `URN` column (requires `urn-minter` + NRS credentials; see below). |
+| `--urn-authority` | NRS authority path for `--mint-urns` (default `HUL.TEST`; or set `DEFAULT_AUTHORITY_PATH`). |
 | `--token` | API token (defaults to `AVIARY_TOKEN`). |
 | `--collection-title` | Override the default `MPS Upload <today>` collection title. |
 | `--collection-description` | Description for a newly created collection. |
@@ -94,6 +123,40 @@ Run `python3 aviary_directory_import.py --help` for all options.
 | `--media-ready-timeout` / `--media-ready-interval` | Bound the wait for media transcoding before attaching an index. |
 | `--marc-import-timeout` / `--marc-import-interval` | Bound the wait for a MARC XML import job to finish. |
 | `--resource-appear-timeout` | Bound the wait for a MARC-imported resource to appear in the collection. |
+
+## Minting persistent URNs (optional)
+
+With `--mint-urns`, each created resource also gets a persistent NRS URN that
+resolves to its Aviary URL, recorded in the log's `URN` column. This uses the
+`urn-minter` library (installed via `uv sync`) and requires NRS credentials in a
+`.env` file in the working directory, which `pydantic-settings` loads
+automatically.
+
+Copy the example and fill in the values:
+
+```bash
+cp .env.example .env
+```
+
+`.env` variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `NRS_ENDPOINT` | Apigee proxy URL for the target environment (dev / qa / prod). |
+| `NRS_AGENT` | Request agent name; must have permission for the authority path in NRS. |
+| `NRS_APIGEE_API_KEY` | Apigee-issued API key for the **same** environment as `NRS_ENDPOINT`. |
+| `NRS_TIMEOUT` | Optional HTTP timeout in seconds (default `30`). |
+| `DEFAULT_AUTHORITY_PATH` | Optional default for `--urn-authority` (otherwise `HUL.TEST`). |
+
+`.env` holds a secret and is gitignored — never commit it. Apigee keys are
+per-environment, so use the key issued for whichever endpoint you point at.
+Verify the wiring without touching NRS by combining `--mint-urns --dry-run`.
+
+A single URL can be minted directly with the throwaway helper:
+
+```bash
+uv run mint_one_urn.py --authority HUL.TEST https://<aviary-url> <resource_id>
+```
 
 ## Expected directory layout
 

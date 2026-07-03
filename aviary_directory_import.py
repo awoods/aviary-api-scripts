@@ -64,6 +64,13 @@ What the script does
    media file is skipped with a warning. Each index is created with
        is_public = true, language = en, title = filename without extension.
 
+If the optional ``--mint-urns`` flag is given, after each resource is created
+the script mints a persistent NRS URN that resolves to the resource's Aviary
+URL (using the ``urn-minter`` library) and records it in the log's ``URN``
+column. NRS credentials come from the environment/.env (NRS_ENDPOINT,
+NRS_AGENT, NRS_APIGEE_API_KEY); the authority path defaults to ``HUL.TEST``
+(override with ``--urn-authority``).
+
 The HTTP request patterns (resource create, presigned media upload, index
 create) follow AVP's own published bulk-import script
 (https://github.com/WeAreAVP/aviary-api-scripts).
@@ -102,6 +109,18 @@ import xml.etree.ElementTree as ET
 
 import requests
 
+# urn-minter (HUIT Artifactory, lts-python index) is only needed when the
+# --mint-urns flag is used, so the import is optional: the script still runs
+# for plain imports on a machine without it installed. main() errors out if
+# --mint-urns is passed while the library is missing.
+try:
+    from urn_minter import (
+        mint_urns, MintItem, CreateResourceDetails, Status, SequenceName,
+    )
+    _URN_MINTER_AVAILABLE = True
+except ImportError:
+    _URN_MINTER_AVAILABLE = False
+
 
 # --------------------------------------------------------------------------- #
 # Configuration constants (override most of these from the command line)
@@ -138,6 +157,11 @@ MEDIA_READY_INTERVAL = 5.0     # seconds between status checks
 
 # Harvard HOLLIS MARC XML webservice (one MARC record per normalized HOLLIS id).
 HOLLIS_MARC_BASE_URL = "https://webservices.lib.harvard.edu/rest/marc/hollis/"
+
+# NRS authority path under which persistent URNs are minted (--mint-urns). The
+# authority must already exist in NRS and the configured agent must have
+# permission for it. Override with --urn-authority.
+URN_AUTHORITY_PATH = "HUL.TEST"
 
 # A MARC XML import runs asynchronously and can take a while; bound the wait.
 MARC_IMPORT_TIMEOUT = 900.0    # max seconds to wait for one MARC import job
@@ -1114,6 +1138,35 @@ def create_resource_via_marc(client, collection_id, hollis_id, job_title,
     return chosen
 
 
+def mint_resource_urn(application_id, aviary_url, authority_path, dry_run):
+    """Mint a persistent NRS URN that resolves to a created Aviary URL.
+
+    Wraps urn_minter.mint_urns for the single-resource case: builds one
+    MintItem (explicit-URL form, file-sequenced resource name) and returns the
+    minted URN string, or "" on failure. NRS credentials come from the
+    environment (NRS_ENDPOINT / NRS_AGENT / NRS_APIGEE_API_KEY) via the
+    library's NRSClientConfig.from_settings() fallback, so no config is passed.
+
+    mint_urns does not raise on API errors (auth/server/transport become a
+    MintResult with an error message), so callers just check the returned "".
+    """
+    item = MintItem(application_id, CreateResourceDetails(
+        authority_path=authority_path,
+        status=Status.ACTIVE,
+        url=aviary_url,
+        sequence=SequenceName.FILE,
+    ))
+    result = mint_urns([item], dry_run=dry_run)[0]
+    if dry_run:
+        # dry_run returns an empty-URN MintResult (no urn, no error): the
+        # payload was built and logged but NRS was never called.
+        return ""
+    if result.ok:
+        return result.urn
+    print(f"    WARNING: URN mint failed for {aviary_url}: {result.error}")
+    return ""
+
+
 def process_resource_directory(client, collection_id, resource_dir, args,
                                work_dir):
     """Create one resource plus its media files and indexes."""
@@ -1154,6 +1207,7 @@ def process_resource_directory(client, collection_id, resource_dir, args,
         "#media": 0,
         "#indexes": 0,
         "URL": "",
+        "URN": "",
         "emailSuccess": parse_dmart_email_success(resource_dir),
     }
     log_row = counts["log_row"]
@@ -1206,8 +1260,17 @@ def process_resource_directory(client, collection_id, resource_dir, args,
             print(f"    ERROR creating resource: {exc}")
             return counts
     counts["resource"] = 1
-    log_row["URL"] = client.get_resource_direct_url(resource_id)
+    aviary_url = client.get_resource_direct_url(resource_id)
+    log_row["URL"] = aviary_url
     print(f"    -> resource id: {resource_id}")
+
+    # Mint a persistent NRS URN that resolves to the Aviary URL (opt-in).
+    if args.mint_urns and aviary_url:
+        urn = mint_resource_urn(resource_user_key, aviary_url,
+                                args.urn_authority, args.dry_run)
+        log_row["URN"] = urn
+        if urn:
+            print(f"    -> URN: {urn}")
 
     # Locate the deliverable directory for this resource.
     deliverable_dir = find_subdirectory(resource_dir, DELIVERABLE_DIR_NAME)
@@ -1339,6 +1402,17 @@ def parse_args(argv=None):
              "mapping on failure). Without this flag, resources are always "
              "built from the project.prop metadata mapping.")
     parser.add_argument(
+        "--mint-urns", dest="mint_urns", action="store_true",
+        help="After creating each resource, mint a persistent NRS URN that "
+             "resolves to its Aviary URL (recorded in the log's URN column). "
+             "Requires the urn-minter library and NRS credentials in the "
+             "environment/.env (NRS_ENDPOINT, NRS_AGENT, NRS_APIGEE_API_KEY).")
+    parser.add_argument(
+        "--urn-authority", default=os.environ.get(
+            "DEFAULT_AUTHORITY_PATH", URN_AUTHORITY_PATH),
+        help="NRS authority path under which URNs are minted with --mint-urns "
+             f"(default {URN_AUTHORITY_PATH}; or set DEFAULT_AUTHORITY_PATH).")
+    parser.add_argument(
         "--log-file", default="mps_aviary_import_log.csv",
         help="CSV log file; one row is appended per resource directory "
              "(default mps_aviary_import_log.csv in the current directory).")
@@ -1357,6 +1431,11 @@ def main(argv=None):
 
     if not args.dry_run and not args.token:
         sys.exit("ERROR: --token (or AVIARY_TOKEN) is required.")
+
+    if args.mint_urns and not _URN_MINTER_AVAILABLE:
+        sys.exit("ERROR: --mint-urns requires the 'urn-minter' library "
+                 "(install urn-minter>=1.0.1 from the HUIT Artifactory "
+                 "lts-python index).")
 
     resource_dirs = find_resource_directories(input_dir)
     if not resource_dirs:
@@ -1407,7 +1486,7 @@ def main(argv=None):
         print(f"    -> collection id: {collection_id}")
 
     log_fields = ["date", "title", "aviaryOrg", "ownercode", "depositnumber",
-                  "shelfnum", "Success", "#media", "#indexes", "URL",
+                  "shelfnum", "Success", "#media", "#indexes", "URL", "URN",
                   "emailSuccess"]
     log_path = os.path.abspath(args.log_file)
     write_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
