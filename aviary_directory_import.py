@@ -749,6 +749,56 @@ class AviaryClient:
                 return candidate["direct_url"]
         return ""
 
+    def _get_resource_metadata_list(self, resource_id):
+        """Return a resource's metadata in the GET list form, or [] on error:
+        [{"label": <field>, "data": [{"value": .., "vocabulary": ..}]}, ...]."""
+        url = self._url(f"api/v1/resources/{resource_id}")
+        try:
+            response = requests.get(url, headers=self._headers(),
+                                    timeout=HTTP_TIMEOUT)
+            self._pace()
+            payload = self._safe_json(response)
+        except requests.exceptions.RequestException:
+            return []
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, list):
+            data = data[0] if data else None
+        for candidate in (data, (data or {}).get("update")
+                          if isinstance(data, dict) else None):
+            if isinstance(candidate, dict) and isinstance(
+                    candidate.get("metadata"), list):
+                return candidate["metadata"]
+        return []
+
+    def add_resource_urn_metadata(self, resource_id, urn):
+        """Add an Identifier metadata element (vocabulary "URN") to a resource.
+
+        PUT /api/v1/resources/{id} using the metadata shape
+        {field_key: {"tag": <Label>, "data": [{value, vocabulary}]}}, which
+        merges at the field level (other metadata fields are left intact). The
+        resource's existing Identifier entries (alephID, findingAid, ...) are
+        read first and re-sent with the URN appended so they are preserved.
+        """
+        url = self._url(f"api/v1/resources/{resource_id}")
+        if self.dry_run:
+            print(f"      [dry-run] PUT {url}  metadata.identifier += "
+                  f"{{vocabulary: 'URN', value: {urn!r}}}")
+            return
+        data = []
+        for entry in self._get_resource_metadata_list(resource_id):
+            if isinstance(entry, dict) and entry.get("label") == "Identifier":
+                for d in entry.get("data", []):
+                    if isinstance(d, dict):
+                        data.append({"value": d.get("value", ""),
+                                     "vocabulary": d.get("vocabulary", "")})
+                break
+        data.append({"value": urn, "vocabulary": "URN"})
+        body = {"metadata": {"identifier": {"tag": "Identifier", "data": data}}}
+        response = requests.put(url, headers=self._headers(), json=body,
+                                timeout=HTTP_TIMEOUT)
+        self._pace()
+        self._require_ok(response, "Resource URN metadata update")
+
     # -- media files ------------------------------------------------------- #
 
     def upload_media_file(self, file_path, resource_id, sort_order):
@@ -1271,6 +1321,16 @@ def process_resource_directory(client, collection_id, resource_dir, args,
         log_row["URN"] = urn
         if urn:
             print(f"    -> URN: {urn}")
+        # Record the URN as a resource metadata element (Identifier / "URN").
+        urn_for_metadata = urn or ("DRY-RUN-URN" if args.dry_run else "")
+        if urn_for_metadata:
+            try:
+                client.add_resource_urn_metadata(resource_id, urn_for_metadata)
+                if urn:
+                    print("    -> recorded URN in resource metadata")
+            except Exception as exc:
+                print(f"    WARNING: could not record URN metadata on resource "
+                      f"{resource_id}: {exc}")
 
     # Locate the deliverable directory for this resource.
     deliverable_dir = find_subdirectory(resource_dir, DELIVERABLE_DIR_NAME)
