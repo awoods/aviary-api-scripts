@@ -89,6 +89,11 @@ Usage
     # alephID is present), falling back to the metadata mapping on failure.
     python3 aviary_directory_import.py /path/to/dir --importMarc
 
+    # Mint a persistent NRS URN per resource, record it in the log's URN
+    # column, and add it to the resource metadata (Identifier / "URN").
+    # Requires the urn-minter library and NRS credentials in a .env file.
+    python3 aviary_directory_import.py /path/to/dir --mint-urns
+
     # Preview the planned API calls without contacting Aviary.
     python3 aviary_directory_import.py /path/to/dir --dry-run
 
@@ -773,27 +778,31 @@ class AviaryClient:
     def add_resource_urn_metadata(self, resource_id, urn):
         """Add an Identifier metadata element (vocabulary "URN") to a resource.
 
-        PUT /api/v1/resources/{id} using the metadata shape
-        {field_key: {"tag": <Label>, "data": [{value, vocabulary}]}}, which
-        merges at the field level (other metadata fields are left intact). The
+        PUT /api/v1/resources/{id} using the SAME metadata shape as resource
+        creation: {FieldLabel: [{"vocabulary": .., "value": ..}]}, where value
+        is a plain string. (The {tag, data:[{value,..}]} shape from the API's
+        location example makes the server treat each value as a hash and raises
+        "no implicit conversion of Symbol into Integer" for text values.) The
         resource's existing Identifier entries (alephID, findingAid, ...) are
-        read first and re-sent with the URN appended so they are preserved.
+        read first and re-sent with the URN appended so they are preserved;
+        the update merges at the field level, leaving other fields intact.
         """
         url = self._url(f"api/v1/resources/{resource_id}")
         if self.dry_run:
-            print(f"      [dry-run] PUT {url}  metadata.identifier += "
+            print(f"      [dry-run] PUT {url}  metadata.Identifier += "
                   f"{{vocabulary: 'URN', value: {urn!r}}}")
             return
-        data = []
+        identifiers = []
         for entry in self._get_resource_metadata_list(resource_id):
             if isinstance(entry, dict) and entry.get("label") == "Identifier":
                 for d in entry.get("data", []):
                     if isinstance(d, dict):
-                        data.append({"value": d.get("value", ""),
-                                     "vocabulary": d.get("vocabulary", "")})
+                        identifiers.append(
+                            {"vocabulary": d.get("vocabulary", ""),
+                             "value": d.get("value", "")})
                 break
-        data.append({"value": urn, "vocabulary": "URN"})
-        body = {"metadata": {"identifier": {"tag": "Identifier", "data": data}}}
+        identifiers.append({"vocabulary": "URN", "value": urn})
+        body = {"metadata": {"Identifier": identifiers}}
         response = requests.put(url, headers=self._headers(), json=body,
                                 timeout=HTTP_TIMEOUT)
         self._pace()

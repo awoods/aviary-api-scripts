@@ -51,8 +51,9 @@ a CSV log (default `mps_aviary_import_log.csv`).
 
 With the optional `--mint-urns` flag, after each resource is created the script
 mints a persistent [NRS](https://nrs.harvard.edu) URN that resolves to the
-resource's Aviary URL (via the `urn-minter` library) and records it in the log's
-`URN` column. See [Minting persistent URNs](#minting-persistent-urns-optional).
+resource's Aviary URL (via the `urn-minter` library), records it in the log's
+`URN` column, and adds it to the resource's metadata as an Identifier (vocabulary
+`URN`). See [Minting persistent URNs](#minting-persistent-urns-optional).
 
 The HTTP request patterns mirror AVP's own published bulk-import scripts
 (<https://github.com/WeAreAVP/aviary-api-scripts>).
@@ -111,7 +112,7 @@ Run `uv run aviary_directory_import.py --help` for all options.
 | --- | --- |
 | `--dry-run` | Scan and print the planned API calls without contacting Aviary. |
 | `--importMarc` | Build resources from Harvard HOLLIS MARC XML when a usable `alephID` is present (default: always use the `project.prop` metadata mapping). |
-| `--mint-urns` | Mint a persistent NRS URN per resource and record it in the log's `URN` column (requires `urn-minter` + NRS credentials; see below). |
+| `--mint-urns` | Mint a persistent NRS URN per resource, record it in the log's `URN` column, and add it to the resource metadata as an Identifier (requires `urn-minter` + NRS credentials; see below). |
 | `--urn-authority` | NRS authority path for `--mint-urns` (default `HUL.TEST`; or set `DEFAULT_AUTHORITY_PATH`). |
 | `--token` | API token (defaults to `AVIARY_TOKEN`). |
 | `--collection-title` | Override the default `MPS Upload <today>` collection title. |
@@ -127,7 +128,8 @@ Run `uv run aviary_directory_import.py --help` for all options.
 ## Minting persistent URNs (optional)
 
 With `--mint-urns`, each created resource also gets a persistent NRS URN that
-resolves to its Aviary URL, recorded in the log's `URN` column. This uses the
+resolves to its Aviary URL, recorded in the log's `URN` column and added to the
+resource's metadata as an Identifier (vocabulary `URN`). This uses the
 `urn-minter` library (installed via `uv sync`) and requires NRS credentials in a
 `.env` file in the working directory, which `pydantic-settings` loads
 automatically.
