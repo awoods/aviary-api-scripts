@@ -754,55 +754,22 @@ class AviaryClient:
                 return candidate["direct_url"]
         return ""
 
-    def _get_resource_metadata_list(self, resource_id):
-        """Return a resource's metadata in the GET list form, or [] on error:
-        [{"label": <field>, "data": [{"value": .., "vocabulary": ..}]}, ...]."""
-        url = self._url(f"api/v1/resources/{resource_id}")
-        try:
-            response = requests.get(url, headers=self._headers(),
-                                    timeout=HTTP_TIMEOUT)
-            self._pace()
-            payload = self._safe_json(response)
-        except requests.exceptions.RequestException:
-            return []
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if isinstance(data, list):
-            data = data[0] if data else None
-        for candidate in (data, (data or {}).get("update")
-                          if isinstance(data, dict) else None):
-            if isinstance(candidate, dict) and isinstance(
-                    candidate.get("metadata"), list):
-                return candidate["metadata"]
-        return []
-
     def add_resource_urn_metadata(self, resource_id, urn):
         """Add an Identifier metadata element (vocabulary "URN") to a resource.
 
-        PUT /api/v1/resources/{id} using the SAME metadata shape as resource
-        creation: {FieldLabel: [{"vocabulary": .., "value": ..}]}, where value
-        is a plain string. (The {tag, data:[{value,..}]} shape from the API's
-        location example makes the server treat each value as a hash and raises
-        "no implicit conversion of Symbol into Integer" for text values.) The
-        resource's existing Identifier entries (alephID, findingAid, ...) are
-        read first and re-sent with the URN appended so they are preserved;
-        the update merges at the field level, leaving other fields intact.
+        PUT /api/v1/resources/{id} with the create-style metadata shape
+        {FieldLabel: [{"vocabulary": .., "value": ..}]}. The update APPENDS the
+        given elements to the resource's existing Identifier metadata, so ONLY
+        the new URN element is sent -- re-sending the existing entries
+        (alephID, findingAid, ...) would duplicate them.
         """
         url = self._url(f"api/v1/resources/{resource_id}")
         if self.dry_run:
             print(f"      [dry-run] PUT {url}  metadata.Identifier += "
                   f"{{vocabulary: 'URN', value: {urn!r}}}")
             return
-        identifiers = []
-        for entry in self._get_resource_metadata_list(resource_id):
-            if isinstance(entry, dict) and entry.get("label") == "Identifier":
-                for d in entry.get("data", []):
-                    if isinstance(d, dict):
-                        identifiers.append(
-                            {"vocabulary": d.get("vocabulary", ""),
-                             "value": d.get("value", "")})
-                break
-        identifiers.append({"vocabulary": "URN", "value": urn})
-        body = {"metadata": {"Identifier": identifiers}}
+        body = {"metadata": {"Identifier": [{"vocabulary": "URN",
+                                             "value": urn}]}}
         response = requests.put(url, headers=self._headers(), json=body,
                                 timeout=HTTP_TIMEOUT)
         self._pace()
