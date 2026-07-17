@@ -300,7 +300,7 @@ RESOURCE_METADATA_MAP = [
     ("creator", "Agent", "Creator"),
     ("date", "Date", ""),
     ("director", "Agent", "Director"),
-    ("genre", "Format", ""),
+    ("genre", "Type", ""),
     ("instrumentalist", "Agent", "Instrumentalist"),
     ("interviewee", "Agent", "Interviewee"),
     ("interviewer", "Agent", "Interviewer"),

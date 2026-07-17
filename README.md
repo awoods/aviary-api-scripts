@@ -30,7 +30,7 @@ Given a top-level directory (a single deposit, or a parent containing several):
    - By default the resource is built from the `project.prop` metadata mapping:
      `title` (→ `shelfnum` → directory name), `metsLabel` as description, the
      `access` code, plus a rich set of additional fields mapped to Aviary
-     metadata (Agent roles such as composer/performer/creator, Date, Format,
+     metadata (Agent roles such as composer/performer/creator, Date, Type,
      Subject, and Identifiers like `alephID`/`findingAid`/`shelfnum`).
    - With the `--importMarc` flag *and* a usable `alephID`, the resource is
      instead built from the Harvard HOLLIS MARC XML record (fetched from the
