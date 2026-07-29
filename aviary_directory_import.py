@@ -63,6 +63,14 @@ What the script does
    media file ``T-529_0006_DM_01_01_{...}.mp3``. An index with no matching
    media file is skipped with a warning. Each index is created with
        is_public = true, language = en, title = filename without extension.
+7. Imports one Aviary caption transcript for every ``.vtt`` file found in the
+   resource's ``captions`` subdirectory. Each caption is attached (via
+   ``resource_file_id``) to the resource's primary (first, by sort order) media
+   file; a VTT carries no per-media identifier, so with multiple media files
+   the association is a best guess and is noted in the log. Each caption is
+   created with
+       is_caption = true, is_public = true, language = en,
+       title = filename without extension.
 
 If the optional ``--mint-urns`` flag is given, after each resource is created
 the script mints a persistent NRS URN that resolves to the resource's Aviary
@@ -187,6 +195,10 @@ INDEX_FILENAME_SUFFIX = "playlist.xml"
 # Names of the sub-directories to look for inside each resource directory.
 DELIVERABLE_DIR_NAME = "deliverable"
 PLAYLISTS_DIR_NAME = "playlists"
+CAPTIONS_DIR_NAME = "captions"
+
+# Caption transcript files: .vtt files in the resource's "captions" subdir.
+CAPTION_EXTENSIONS = (".vtt",)
 
 # Aviary resource Access Status values used here: public / private / internal
 # ("internal" requires an Aviary API that accepts it). project.prop "access"
@@ -455,6 +467,19 @@ def find_index_files(deliverable_dir):
     for name in os.listdir(playlists_dir):
         full = os.path.join(playlists_dir, name)
         if os.path.isfile(full) and name.lower().endswith(INDEX_FILENAME_SUFFIX):
+            matches.append(full)
+    return sorted(matches, key=lambda p: os.path.basename(p).lower())
+
+
+def find_caption_files(resource_dir):
+    """All .vtt caption files in the resource's "captions" subdir, sorted."""
+    captions_dir = find_subdirectory(resource_dir, CAPTIONS_DIR_NAME)
+    if not captions_dir:
+        return []
+    matches = []
+    for name in os.listdir(captions_dir):
+        full = os.path.join(captions_dir, name)
+        if os.path.isfile(full) and name.lower().endswith(CAPTION_EXTENSIONS):
             matches.append(full)
     return sorted(matches, key=lambda p: os.path.basename(p).lower())
 
@@ -755,21 +780,26 @@ class AviaryClient:
         return ""
 
     def add_resource_urn_metadata(self, resource_id, urn):
-        """Add an Identifier metadata element (vocabulary "URN") to a resource.
+        """Record the URN on a resource via PUT /api/v1/resources/{id}.
 
-        PUT /api/v1/resources/{id} with the create-style metadata shape
-        {FieldLabel: [{"vocabulary": .., "value": ..}]}. The update APPENDS the
-        given elements to the resource's existing Identifier metadata, so ONLY
-        the new URN element is sent -- re-sending the existing entries
-        (alephID, findingAid, ...) would duplicate them.
+        Sets two things in one request:
+          - the top-level ``custom_unique_identifier`` string field = the URN;
+          - an Identifier metadata element (vocabulary "URN") using the
+            create-style shape {FieldLabel: [{"vocabulary": .., "value": ..}]}.
+        The metadata update APPENDS to the resource's existing Identifier
+        metadata, so ONLY the new URN element is sent -- re-sending the
+        existing entries (alephID, findingAid, ...) would duplicate them.
         """
         url = self._url(f"api/v1/resources/{resource_id}")
         if self.dry_run:
-            print(f"      [dry-run] PUT {url}  metadata.Identifier += "
+            print(f"      [dry-run] PUT {url}  custom_unique_identifier="
+                  f"{urn!r}, metadata.Identifier += "
                   f"{{vocabulary: 'URN', value: {urn!r}}}")
             return
-        body = {"metadata": {"Identifier": [{"vocabulary": "URN",
-                                             "value": urn}]}}
+        body = {
+            "custom_unique_identifier": urn,
+            "metadata": {"Identifier": [{"vocabulary": "URN", "value": urn}]},
+        }
         response = requests.put(url, headers=self._headers(), json=body,
                                 timeout=HTTP_TIMEOUT)
         self._pace()
@@ -1078,6 +1108,44 @@ class AviaryClient:
             raise RuntimeError(f"Index create returned no id: {payload}")
         return index_id
 
+    def create_transcript(self, transcript_file, media_id):
+        """Create a caption transcript from a VTT file linked to a media file.
+
+        Per the task: is_caption=true, language=en, is_public=true,
+        title = filename without extension, resource_file_id = the media id.
+        POST /api/v1/transcripts requires is_caption, language, title,
+        is_public, associated_file and resource_file_id.
+        """
+        url = self._url("api/v1/transcripts")
+        title = os.path.splitext(os.path.basename(transcript_file))[0]
+        data = {
+            "is_caption": "true",
+            "language": "en",
+            "title": title,
+            "is_public": "true",
+            "resource_file_id": media_id,
+        }
+        if self.dry_run:
+            print(f"    [dry-run] POST {url}  "
+                  f"title={title!r} resource_file_id={media_id} "
+                  f"is_caption=true is_public=true language=en "
+                  f"file={os.path.basename(transcript_file)!r}")
+            return f"DRY-RUN-TRANSCRIPT-{title}"
+
+        file_type = mimetypes.guess_type(transcript_file)[0] or "text/vtt"
+        with open(transcript_file, "rb") as fh:
+            files = {"associated_file": (os.path.basename(transcript_file), fh,
+                                         file_type)}
+            response = requests.post(url, headers=self._headers(),
+                                     data=data, files=files,
+                                     timeout=UPLOAD_TIMEOUT)
+        self._pace()
+        payload = self._require_ok(response, "Transcript create")
+        transcript_id = self._extract_id(payload)
+        if transcript_id is None:
+            raise RuntimeError(f"Transcript create returned no id: {payload}")
+        return transcript_id
+
     # -- misc -------------------------------------------------------------- #
 
     @staticmethod
@@ -1218,7 +1286,7 @@ def process_resource_directory(client, collection_id, resource_dir, args,
     print(f"    access      : {props.get('access', '')!r} -> {access}")
     print(f"    description : {description[:80]}{'...' if len(description) > 80 else ''}")
 
-    counts = {"resource": 0, "media": 0, "indexes": 0}
+    counts = {"resource": 0, "media": 0, "indexes": 0, "captions": 0}
 
     # Build the CSV log row for this resource (main() fills #media/#indexes
     # from counts and writes it). Success/URL are updated as we go.
@@ -1370,6 +1438,46 @@ def process_resource_directory(client, collection_id, resource_dir, args,
             counts["indexes"] += 1
         except Exception as exc:
             print(f"      ERROR creating index '{index_name}': {exc}")
+
+    # Import caption transcripts (.vtt) from the resource's "captions" subdir.
+    # A transcript attaches to one media file; a VTT carries no per-media
+    # identifier, so each caption is attached to the resource's primary (first,
+    # by sort order) media file. If there are multiple media files the
+    # association is a best guess and is called out in the log.
+    caption_files = find_caption_files(resource_dir)
+    if caption_files:
+        media_ids = list(media_id_by_key.values())
+        print(f"    caption files: {len(caption_files)}")
+        if not media_ids:
+            print("      WARNING: captions present but no media file was "
+                  "uploaded; skipping captions.")
+        else:
+            primary_media_id = media_ids[0]
+            if len(media_ids) > 1:
+                print(f"      NOTE: {len(media_ids)} media files present; "
+                      f"attaching caption(s) to the first (media id "
+                      f"{primary_media_id}).")
+            for caption_path in caption_files:
+                caption_name = os.path.basename(caption_path)
+                print(f"      caption '{caption_name}' -> media id "
+                      f"{primary_media_id}")
+                # A caption attaches to the media file, so wait for it to
+                # finish processing first (as with indexes).
+                if not client.wait_for_media_ready(primary_media_id,
+                                                   media_ready_timeout,
+                                                   media_ready_interval):
+                    print(f"      WARNING: media id {primary_media_id} still "
+                          f"processing after {media_ready_timeout}s; "
+                          f"attempting caption anyway.")
+                try:
+                    client._with_retries(
+                        f"caption create '{caption_name}'",
+                        lambda cp=caption_path, mid=primary_media_id:
+                        client.create_transcript(cp, mid))
+                    counts["captions"] += 1
+                except Exception as exc:
+                    print(f"      ERROR creating caption '{caption_name}': "
+                          f"{exc}")
 
     return counts
 
@@ -1528,7 +1636,7 @@ def main(argv=None):
     write_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
 
     work_dir = tempfile.mkdtemp(prefix="aviary_marc_")
-    totals = {"resource": 0, "media": 0, "indexes": 0}
+    totals = {"resource": 0, "media": 0, "indexes": 0, "captions": 0}
     try:
         with open(log_path, "a", newline="", encoding="utf-8") as log_fh:
             log_writer = csv.DictWriter(log_fh, fieldnames=log_fields)
@@ -1563,6 +1671,7 @@ def main(argv=None):
     print(f"    Resources  : {totals['resource']}")
     print(f"    Media files: {totals['media']}")
     print(f"    Indexes    : {totals['indexes']}")
+    print(f"    Captions   : {totals['captions']}")
 
 
 if __name__ == "__main__":

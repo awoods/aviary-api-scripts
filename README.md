@@ -44,6 +44,13 @@ Given a top-level directory (a single deposit, or a parent containing several):
    each linked to the media file whose filename (without extension) matches the
    playlist's `<dc:identifier>` value. Indexes with no matching media file are
    skipped with a warning.
+6. **Imports caption transcripts** — every `.vtt` file in the resource's
+   `captions/` subdirectory, each created as a public English caption
+   (`is_caption=true`, `is_public=true`, `language=en`, title = filename without
+   extension). A caption attaches to a single media file, but a VTT carries no
+   per-media identifier, so each caption is attached to the resource's *primary*
+   (first, by sort order) media file. When a resource has more than one media
+   file this association is a best guess and is called out in the run log.
 
 Media uploads and index creation are retried with exponential backoff on
 transient errors, and each resource directory's outcome is appended as a row to
@@ -52,8 +59,9 @@ a CSV log (default `mps_aviary_import_log.csv`).
 With the optional `--mint-urns` flag, after each resource is created the script
 mints a persistent [NRS](https://nrs.harvard.edu) URN that resolves to the
 resource's Aviary URL (via the `urn-minter` library), records it in the log's
-`URN` column, and adds it to the resource's metadata as an Identifier (vocabulary
-`URN`). See [Minting persistent URNs](#minting-persistent-urns-optional).
+`URN` column, sets it as the resource's top-level `custom_unique_identifier`,
+and adds it to the resource's metadata as an Identifier (vocabulary `URN`). See
+[Minting persistent URNs](#minting-persistent-urns-optional).
 
 The HTTP request patterns mirror AVP's own published bulk-import scripts
 (<https://github.com/WeAreAVP/aviary-api-scripts>).
@@ -128,8 +136,9 @@ Run `uv run aviary_directory_import.py --help` for all options.
 ## Minting persistent URNs (optional)
 
 With `--mint-urns`, each created resource also gets a persistent NRS URN that
-resolves to its Aviary URL, recorded in the log's `URN` column and added to the
-resource's metadata as an Identifier (vocabulary `URN`). This uses the
+resolves to its Aviary URL, recorded in the log's `URN` column, set as the
+resource's top-level `custom_unique_identifier`, and added to the resource's
+metadata as an Identifier (vocabulary `URN`). This uses the
 `urn-minter` library (installed via `uv sync`) and requires NRS credentials in a
 `.env` file in the working directory, which `pydantic-settings` loads
 automatically.
@@ -166,6 +175,8 @@ uv run mint_one_urn.py --authority HUL.TEST https://<aviary-url> <resource_id>
 top_level_directory/
 └── <resource_dir>/
     ├── project.prop            # key=value metadata (aviaryOrg, alephID, title, access, …)
+    ├── captions/
+    │   └── *.vtt               # caption transcripts, attached to the primary media file
     └── deliverable/
         ├── *.mp3 / *.mp4 / *.mov   # media files (any depth)
         └── playlists/
@@ -173,5 +184,6 @@ top_level_directory/
 ```
 
 The run prints a per-resource log and a final summary of collections, resources,
-media files, and indexes created, and appends a row per resource directory to the
-CSV log. Errors on one resource directory are logged and the batch continues.
+media files, indexes, and captions created, and appends a row per resource
+directory to the CSV log. Errors on one resource directory are logged and the
+batch continues.
