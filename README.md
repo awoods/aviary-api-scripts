@@ -10,8 +10,8 @@ Harvard Library MPS (Media Preservation Services) deposits arrive as directory
 trees, each resource directory described by a `project.prop` metadata file and
 holding its media under a `deliverable/` subdirectory. This script walks such a
 tree and, for each resource directory, creates the corresponding Aviary
-**collection**, **resource**, **media files**, and **indexes** — turning a batch
-of deposits into published Aviary records in one run.
+**collection**, **resource**, **media files**, **indexes**, and **captions** —
+turning a batch of deposits into published Aviary records in one run.
 
 It is intended as operational tooling for librarians/archivists running MPS
 uploads, not as a reusable library.
@@ -44,8 +44,14 @@ Given a top-level directory (a single deposit, or a parent containing several):
    each linked to the media file whose filename (without extension) matches the
    playlist's `<dc:identifier>` value. Indexes with no matching media file are
    skipped with a warning.
+6. **Creates captions** — every `.vtt` in the resource's `captions/`
+   subdirectory, each attached to the media file whose filename (without
+   extension) equals the caption's base identifier (its stem minus a trailing
+   `_captions`) or begins with that base + `_`. Each media file receives at most
+   one caption (`is_caption`, `is_public`, `language=en`); captions with no
+   matching media file are skipped with a warning.
 
-Media uploads and index creation are retried with exponential backoff on
+Media uploads, index creation, and caption creation are retried with exponential backoff on
 transient errors, and each resource directory's outcome is appended as a row to
 a CSV log (default `mps_aviary_import_log.csv`).
 
@@ -170,8 +176,10 @@ top_level_directory/
         ├── *.mp3 / *.mp4 / *.mov   # media files (any depth)
         └── playlists/
             └── *playlist.xml       # AES60 (FADGI) index files, matched to media by <dc:identifier>
+    └── captions/
+        └── *.vtt                   # caption transcripts, matched to media by filename base
 ```
 
 The run prints a per-resource log and a final summary of collections, resources,
-media files, and indexes created, and appends a row per resource directory to the
-CSV log. Errors on one resource directory are logged and the batch continues.
+media files, indexes, and captions created, and appends a row per resource
+directory to the CSV log. Errors on one resource directory are logged and the batch continues.
