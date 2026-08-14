@@ -44,16 +44,24 @@ Given a top-level directory (a single deposit, or a parent containing several):
    each linked to the media file whose filename (without extension) matches the
    playlist's `<dc:identifier>` value. Indexes with no matching media file are
    skipped with a warning.
+6. **Imports caption transcripts** — every `*.vtt` in the resource's
+   `captions/` subdirectory, each linked to the media file whose filename
+   (without extension) matches the caption's base identifier (its filename
+   stem minus a trailing `_captions`). Each media file receives at most one
+   caption, and captions with no matching media file are skipped with a
+   warning.
 
-Media uploads and index creation are retried with exponential backoff on
-transient errors, and each resource directory's outcome is appended as a row to
-a CSV log (default `mps_aviary_import_log.csv`).
+Media uploads, index creation, and caption creation are retried with
+exponential backoff on transient errors, and each resource directory's
+outcome is appended as a row to a CSV log (default
+`mps_aviary_import_log.csv`).
 
 With the optional `--mint-urns` flag, after each resource is created the script
 mints a persistent [NRS](https://nrs.harvard.edu) URN that resolves to the
 resource's Aviary URL (via the `urn-minter` library), records it in the log's
-`URN` column, and adds it to the resource's metadata as an Identifier (vocabulary
-`URN`). See [Minting persistent URNs](#minting-persistent-urns-optional).
+`URN` column, sets it as the resource's `custom_unique_identifier`, and adds it
+to the resource's metadata as an Identifier (vocabulary `URN`). See
+[Minting persistent URNs](#minting-persistent-urns-optional).
 
 The HTTP request patterns mirror AVP's own published bulk-import scripts
 (<https://github.com/WeAreAVP/aviary-api-scripts>).
@@ -166,10 +174,12 @@ uv run mint_one_urn.py --authority HUL.TEST https://<aviary-url> <resource_id>
 top_level_directory/
 └── <resource_dir>/
     ├── project.prop            # key=value metadata (aviaryOrg, alephID, title, access, …)
-    └── deliverable/
-        ├── *.mp3 / *.mp4 / *.mov   # media files (any depth)
-        └── playlists/
-            └── *playlist.xml       # AES60 (FADGI) index files, matched to media by <dc:identifier>
+    ├── deliverable/
+    │   ├── *.mp3 / *.mp4 / *.mov   # media files (any depth)
+    │   └── playlists/
+    │       └── *playlist.xml       # AES60 (FADGI) index files, matched to media by <dc:identifier>
+    └── captions/
+        └── *.vtt                   # caption files, matched to media by filename stem
 ```
 
 The run prints a per-resource log and a final summary of collections, resources,
