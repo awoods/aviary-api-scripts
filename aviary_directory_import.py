@@ -63,6 +63,17 @@ What the script does
    media file ``T-529_0006_DM_01_01_{...}.mp3``. An index with no matching
    media file is skipped with a warning. Each index is created with
        is_public = true, language = en, title = filename without extension.
+7. Imports one Aviary caption transcript for every ``.vtt`` file found in the
+   resource's ``captions`` subdirectory. Each caption is matched to a specific
+   media file by the same naming rule used for indexes: the caption's base
+   identifier (its filename stem minus a trailing ``_captions``) matches the
+   media file whose stem equals that base or begins with base + ``_`` -- e.g.
+   ``Vt-286_0096_captions.vtt`` (base ``Vt-286_0096``) attaches to media
+   ``Vt-286_0096_DM_01_01.mov``. Each media file receives at most one caption,
+   and a caption with no matching media file is skipped with a warning. Each
+   caption is created with
+       is_caption = true, is_public = true, language = en,
+       title = filename without extension.
 
 If the optional ``--mint-urns`` flag is given, after each resource is created
 the script mints a persistent NRS URN that resolves to the resource's Aviary
@@ -187,6 +198,10 @@ INDEX_FILENAME_SUFFIX = "playlist.xml"
 # Names of the sub-directories to look for inside each resource directory.
 DELIVERABLE_DIR_NAME = "deliverable"
 PLAYLISTS_DIR_NAME = "playlists"
+CAPTIONS_DIR_NAME = "captions"
+
+# Caption transcript files: .vtt files in the resource's "captions" subdir.
+CAPTION_EXTENSIONS = (".vtt",)
 
 # Aviary resource Access Status values used here: public / private / internal
 # ("internal" requires an Aviary API that accepts it). project.prop "access"
@@ -389,16 +404,21 @@ def find_resource_directories(top_level):
     """Return sorted list of directories that directly contain project.prop.
 
     The supplied path itself counts if it contains a project.prop; otherwise
-    every descendant directory is searched.
+    every descendant directory is searched. Resource directories do not nest:
+    once a directory is identified as a resource root, its subtree is NOT
+    searched further. This prevents a backup copy of project.prop tucked inside
+    a resource's own tree (e.g. ``MP01413/misc/prop_files/project.prop``) from
+    creating a second, media-less resource.
     """
-    resource_dirs = []
     if os.path.isfile(os.path.join(top_level, "project.prop")):
-        resource_dirs.append(top_level)
-    for root, _dirs, files in os.walk(top_level):
-        if root == top_level:
-            continue
+        return [top_level]
+    resource_dirs = []
+    for root, dirs, files in os.walk(top_level):
         if "project.prop" in files:
             resource_dirs.append(root)
+            # Prune: everything below a resource root belongs to that resource,
+            # so don't descend into it looking for more project.prop files.
+            dirs[:] = []
     return sorted(set(resource_dirs))
 
 
@@ -436,11 +456,18 @@ def find_subdirectory(start_dir, target_name):
     return None
 
 
+def is_macos_hidden(name):
+    """True if a filename is a macOS AppleDouble sidecar (starts with "._")."""
+    return os.path.basename(name).startswith("._")
+
+
 def find_media_files(deliverable_dir):
     """All media files under the deliverable dir, sorted alphanumerically."""
     matches = []
     for root, _dirs, files in os.walk(deliverable_dir):
         for name in files:
+            if is_macos_hidden(name):
+                continue
             if name.lower().endswith(MEDIA_EXTENSIONS):
                 matches.append(os.path.join(root, name))
     return sorted(matches, key=lambda p: os.path.basename(p).lower())
@@ -453,8 +480,25 @@ def find_index_files(deliverable_dir):
         return []
     matches = []
     for name in os.listdir(playlists_dir):
+        if is_macos_hidden(name):
+            continue
         full = os.path.join(playlists_dir, name)
         if os.path.isfile(full) and name.lower().endswith(INDEX_FILENAME_SUFFIX):
+            matches.append(full)
+    return sorted(matches, key=lambda p: os.path.basename(p).lower())
+
+
+def find_caption_files(resource_dir):
+    """All .vtt caption files in the resource's "captions" subdir, sorted."""
+    captions_dir = find_subdirectory(resource_dir, CAPTIONS_DIR_NAME)
+    if not captions_dir:
+        return []
+    matches = []
+    for name in os.listdir(captions_dir):
+        if is_macos_hidden(name):
+            continue
+        full = os.path.join(captions_dir, name)
+        if os.path.isfile(full) and name.lower().endswith(CAPTION_EXTENSIONS):
             matches.append(full)
     return sorted(matches, key=lambda p: os.path.basename(p).lower())
 
@@ -482,6 +526,20 @@ def media_match_key(media_path):
     """The key used to match a media file to a playlist's dc:identifier:
     the filename without its extension."""
     return os.path.splitext(os.path.basename(media_path))[0]
+
+
+def caption_match_key(caption_path):
+    """Base identifier for matching a caption to a media file.
+
+    The caption filename stem with a trailing "_captions" removed
+    (case-insensitive). A caption matches the media file whose stem equals this
+    base or begins with base + "_". E.g. "Vt-286_0096_captions" -> base
+    "Vt-286_0096", which matches media "Vt-286_0096_DM_01_01".
+    """
+    stem = os.path.splitext(os.path.basename(caption_path))[0]
+    if stem.lower().endswith("_captions"):
+        stem = stem[: -len("_captions")]
+    return stem
 
 
 def parse_dmart_email_success(resource_dir):
@@ -755,21 +813,26 @@ class AviaryClient:
         return ""
 
     def add_resource_urn_metadata(self, resource_id, urn):
-        """Add an Identifier metadata element (vocabulary "URN") to a resource.
+        """Record the URN on a resource via PUT /api/v1/resources/{id}.
 
-        PUT /api/v1/resources/{id} with the create-style metadata shape
-        {FieldLabel: [{"vocabulary": .., "value": ..}]}. The update APPENDS the
-        given elements to the resource's existing Identifier metadata, so ONLY
-        the new URN element is sent -- re-sending the existing entries
-        (alephID, findingAid, ...) would duplicate them.
+        Sets two things in one request:
+          - the top-level ``custom_unique_identifier`` string field = the URN;
+          - an Identifier metadata element (vocabulary "URN") using the
+            create-style shape {FieldLabel: [{"vocabulary": .., "value": ..}]}.
+        The metadata update APPENDS to the resource's existing Identifier
+        metadata, so ONLY the new URN element is sent -- re-sending the
+        existing entries (alephID, findingAid, ...) would duplicate them.
         """
         url = self._url(f"api/v1/resources/{resource_id}")
         if self.dry_run:
-            print(f"      [dry-run] PUT {url}  metadata.Identifier += "
+            print(f"      [dry-run] PUT {url}  custom_unique_identifier="
+                  f"{urn!r}, metadata.Identifier += "
                   f"{{vocabulary: 'URN', value: {urn!r}}}")
             return
-        body = {"metadata": {"Identifier": [{"vocabulary": "URN",
-                                             "value": urn}]}}
+        body = {
+            "custom_unique_identifier": urn,
+            "metadata": {"Identifier": [{"vocabulary": "URN", "value": urn}]},
+        }
         response = requests.put(url, headers=self._headers(), json=body,
                                 timeout=HTTP_TIMEOUT)
         self._pace()
@@ -1078,6 +1141,44 @@ class AviaryClient:
             raise RuntimeError(f"Index create returned no id: {payload}")
         return index_id
 
+    def create_transcript(self, transcript_file, media_id):
+        """Create a caption transcript from a VTT file linked to a media file.
+
+        Per the task: is_caption=true, language=en, is_public=true,
+        title = filename without extension, resource_file_id = the media id.
+        POST /api/v1/transcripts requires is_caption, language, title,
+        is_public, associated_file and resource_file_id.
+        """
+        url = self._url("api/v1/transcripts")
+        title = os.path.splitext(os.path.basename(transcript_file))[0]
+        data = {
+            "is_caption": "true",
+            "language": "en",
+            "title": title,
+            "is_public": "true",
+            "resource_file_id": media_id,
+        }
+        if self.dry_run:
+            print(f"    [dry-run] POST {url}  "
+                  f"title={title!r} resource_file_id={media_id} "
+                  f"is_caption=true is_public=true language=en "
+                  f"file={os.path.basename(transcript_file)!r}")
+            return f"DRY-RUN-TRANSCRIPT-{title}"
+
+        file_type = mimetypes.guess_type(transcript_file)[0] or "text/vtt"
+        with open(transcript_file, "rb") as fh:
+            files = {"associated_file": (os.path.basename(transcript_file), fh,
+                                         file_type)}
+            response = requests.post(url, headers=self._headers(),
+                                     data=data, files=files,
+                                     timeout=UPLOAD_TIMEOUT)
+        self._pace()
+        payload = self._require_ok(response, "Transcript create")
+        transcript_id = self._extract_id(payload)
+        if transcript_id is None:
+            raise RuntimeError(f"Transcript create returned no id: {payload}")
+        return transcript_id
+
     # -- misc -------------------------------------------------------------- #
 
     @staticmethod
@@ -1218,7 +1319,7 @@ def process_resource_directory(client, collection_id, resource_dir, args,
     print(f"    access      : {props.get('access', '')!r} -> {access}")
     print(f"    description : {description[:80]}{'...' if len(description) > 80 else ''}")
 
-    counts = {"resource": 0, "media": 0, "indexes": 0}
+    counts = {"resource": 0, "media": 0, "indexes": 0, "captions": 0}
 
     # Build the CSV log row for this resource (main() fills #media/#indexes
     # from counts and writes it). Success/URL are updated as we go.
@@ -1232,6 +1333,7 @@ def process_resource_directory(client, collection_id, resource_dir, args,
         "Success": "Failure",
         "#media": 0,
         "#indexes": 0,
+        "#captions": 0,
         "URL": "",
         "URN": "",
         "emailSuccess": parse_dmart_email_success(resource_dir),
@@ -1370,6 +1472,50 @@ def process_resource_directory(client, collection_id, resource_dir, args,
             counts["indexes"] += 1
         except Exception as exc:
             print(f"      ERROR creating index '{index_name}': {exc}")
+
+    # Import caption transcripts (.vtt) from the resource's "captions" subdir.
+    # Each caption is matched to a specific media file by the same naming rule
+    # used for indexes: the caption's base identifier (filename stem minus a
+    # trailing "_captions") matches the media file whose stem equals that base
+    # or begins with base + "_". Each media file receives at most one caption.
+    caption_files = find_caption_files(resource_dir)
+    if caption_files:
+        print(f"    caption files: {len(caption_files)}")
+        captioned_media = set()  # media ids that already have a caption
+        for caption_path in caption_files:
+            caption_name = os.path.basename(caption_path)
+            base = caption_match_key(caption_path)
+            match_id = None
+            match_stem = None
+            for stem, mid in media_id_by_key.items():
+                if mid in captioned_media:
+                    continue
+                if stem == base or stem.startswith(base + "_"):
+                    match_id = mid
+                    match_stem = stem
+                    break
+            if match_id is None:
+                print(f"      WARNING: caption '{caption_name}' has no matching "
+                      f"media file (base '{base}'); skipping.")
+                continue
+            captioned_media.add(match_id)
+            print(f"      caption '{caption_name}' -> media '{match_stem}' "
+                  f"(id {match_id})")
+            # A caption attaches to the media file, so wait for it to finish
+            # processing first (as with indexes).
+            if not client.wait_for_media_ready(match_id, media_ready_timeout,
+                                               media_ready_interval):
+                print(f"      WARNING: media id {match_id} still processing "
+                      f"after {media_ready_timeout}s; attempting caption "
+                      f"anyway.")
+            try:
+                client._with_retries(
+                    f"caption create '{caption_name}'",
+                    lambda cp=caption_path, mid=match_id:
+                    client.create_transcript(cp, mid))
+                counts["captions"] += 1
+            except Exception as exc:
+                print(f"      ERROR creating caption '{caption_name}': {exc}")
 
     return counts
 
@@ -1522,13 +1668,13 @@ def main(argv=None):
         print(f"    -> collection id: {collection_id}")
 
     log_fields = ["date", "title", "aviaryOrg", "ownercode", "depositnumber",
-                  "shelfnum", "Success", "#media", "#indexes", "URL", "URN",
-                  "emailSuccess"]
+                  "shelfnum", "Success", "#media", "#indexes", "#captions",
+                  "URL", "URN", "emailSuccess"]
     log_path = os.path.abspath(args.log_file)
     write_header = not os.path.exists(log_path) or os.path.getsize(log_path) == 0
 
     work_dir = tempfile.mkdtemp(prefix="aviary_marc_")
-    totals = {"resource": 0, "media": 0, "indexes": 0}
+    totals = {"resource": 0, "media": 0, "indexes": 0, "captions": 0}
     try:
         with open(log_path, "a", newline="", encoding="utf-8") as log_fh:
             log_writer = csv.DictWriter(log_fh, fieldnames=log_fields)
@@ -1544,6 +1690,7 @@ def main(argv=None):
                     if log_row is not None:
                         log_row["#media"] = counts.get("media", 0)
                         log_row["#indexes"] = counts.get("indexes", 0)
+                        log_row["#captions"] = counts.get("captions", 0)
                         # Success only if the resource was created AND at least
                         # one media file was imported successfully.
                         log_row["Success"] = (
@@ -1563,6 +1710,7 @@ def main(argv=None):
     print(f"    Resources  : {totals['resource']}")
     print(f"    Media files: {totals['media']}")
     print(f"    Indexes    : {totals['indexes']}")
+    print(f"    Captions   : {totals['captions']}")
 
 
 if __name__ == "__main__":
