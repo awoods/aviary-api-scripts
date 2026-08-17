@@ -77,10 +77,12 @@ What the script does
 
 If the optional ``--mint-urns`` flag is given, after each resource is created
 the script mints a persistent NRS URN that resolves to the resource's Aviary
-URL (using the ``urn-minter`` library) and records it in the log's ``URN``
-column. NRS credentials come from the environment/.env (NRS_ENDPOINT,
-NRS_AGENT, NRS_APIGEE_API_KEY); the authority path defaults to ``HUL.TEST``
-(override with ``--urn-authority``).
+persistent_url (using the ``urn-minter`` library) and records it in the log's
+``URN`` column. NRS credentials come from the environment/.env (NRS_ENDPOINT,
+NRS_AGENT, NRS_APIGEE_API_KEY). The authority path is read from the
+``authorityPath`` field of ``audio.properties`` or ``video.properties`` at the
+resource-directory root, falling back to ``--urn-authority`` (default
+``HUL.TEST``) if neither file provides one.
 
 The HTTP request patterns (resource create, presigned media upload, index
 create) follow AVP's own published bulk-import script
@@ -568,6 +570,47 @@ def parse_dmart_email_success(resource_dir):
     return ""
 
 
+# Java-style ".properties" files at the resource-directory root that carry the
+# NRS authorityPath for URN minting.
+PROPERTIES_FILENAMES = ("audio.properties", "video.properties")
+
+
+def read_properties_value(path, key):
+    """Return a single key's value from a Java-style .properties file.
+
+    Lines are ``key=value``; ``#``/``!`` lines are comments. Split on the first
+    ``=``. Returns None if the key is absent or the file can't be read.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line[0] in "#!":
+                    continue
+                k, sep, v = line.partition("=")
+                if sep and k.strip() == key:
+                    return v.strip()
+    except OSError:
+        return None
+    return None
+
+
+def find_authority_path(resource_dir):
+    """Return the NRS authorityPath for a resource, or None.
+
+    Read from audio.properties or video.properties at the resource directory
+    root ONLY (the "highest level") -- not from nested copies such as a
+    misc/prop_files/ backup, which would otherwise be ambiguous.
+    """
+    for fname in PROPERTIES_FILENAMES:
+        path = os.path.join(resource_dir, fname)
+        if os.path.isfile(path):
+            value = read_properties_value(path, "authorityPath")
+            if value:
+                return value
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # Aviary API client
 # --------------------------------------------------------------------------- #
@@ -788,14 +831,22 @@ class AviaryClient:
         self._pace()
         self._require_ok(response, "Resource access update")
 
-    def get_resource_direct_url(self, resource_id):
-        """Return a resource's direct_url via GET /api/v1/resources/{id}.
+    def get_resource_urls(self, resource_id):
+        """Return a resource's URLs as {"direct_url": .., "persistent_url": ..}
+        via GET /api/v1/resources/{id}. Missing values are "".
 
-        Returns "" if it can't be determined. The field appears on the resource
-        object (and under data.update in some responses).
+        The fields appear on the resource object (and under data.update in some
+        responses): persistent_url is the stable "/r/..." link; direct_url is
+        the collection_resources path.
         """
+        result = {"direct_url": "", "persistent_url": ""}
         if self.dry_run:
-            return f"https://example.aviaryplatform.com/r/{resource_id}"
+            return {
+                "direct_url": f"https://example.aviaryplatform.com/collections/"
+                              f"0/collection_resources/{resource_id}",
+                "persistent_url": f"https://example.aviaryplatform.com/r/"
+                                  f"{resource_id}",
+            }
         url = self._url(f"api/v1/resources/{resource_id}")
         try:
             response = requests.get(url, headers=self._headers(),
@@ -803,40 +854,55 @@ class AviaryClient:
             self._pace()
             payload = self._safe_json(response)
         except requests.exceptions.RequestException:
-            return ""
+            return result
         data = payload.get("data") if isinstance(payload, dict) else None
         if isinstance(data, list):
             data = data[0] if data else None
-        for candidate in (data, (data or {}).get("update") if isinstance(data, dict) else None):
-            if isinstance(candidate, dict) and candidate.get("direct_url"):
-                return candidate["direct_url"]
-        return ""
+        for candidate in (data, (data or {}).get("update")
+                          if isinstance(data, dict) else None):
+            if not isinstance(candidate, dict):
+                continue
+            for key in result:
+                if not result[key] and candidate.get(key):
+                    result[key] = candidate[key]
+        return result
 
     def add_resource_urn_metadata(self, resource_id, urn):
         """Record the URN on a resource via PUT /api/v1/resources/{id}.
 
-        Sets two things in one request:
-          - the top-level ``custom_unique_identifier`` string field = the URN;
-          - an Identifier metadata element (vocabulary "URN") using the
-            create-style shape {FieldLabel: [{"vocabulary": .., "value": ..}]}.
-        The metadata update APPENDS to the resource's existing Identifier
-        metadata, so ONLY the new URN element is sent -- re-sending the
-        existing entries (alephID, findingAid, ...) would duplicate them.
+        Two separate PUTs (kept separate because a combined request applied only
+        the metadata and dropped the custom_unique_identifier):
+          1. metadata -- append an Identifier element (vocabulary "URN") using
+             the create-style shape {FieldLabel: [{"vocabulary":..,"value":..}]}.
+             This APPENDS to existing Identifier metadata, so only the new URN
+             element is sent (re-sending existing entries would duplicate them).
+          2. custom_unique_identifier -- set the top-level string field to the
+             URN. It is sent nested under "resource" (and also top-level) so it
+             lands in the update's resource params; the documented PUT body only
+             lists title/access/is_featured/metadata, so a bare top-level
+             custom_unique_identifier was being dropped.
         """
         url = self._url(f"api/v1/resources/{resource_id}")
         if self.dry_run:
-            print(f"      [dry-run] PUT {url}  custom_unique_identifier="
-                  f"{urn!r}, metadata.Identifier += "
+            print(f"      [dry-run] PUT {url}  metadata.Identifier += "
                   f"{{vocabulary: 'URN', value: {urn!r}}}")
+            print(f"      [dry-run] PUT {url}  "
+                  f"resource.custom_unique_identifier={urn!r}")
             return
-        body = {
-            "custom_unique_identifier": urn,
-            "metadata": {"Identifier": [{"vocabulary": "URN", "value": urn}]},
-        }
-        response = requests.put(url, headers=self._headers(), json=body,
-                                timeout=HTTP_TIMEOUT)
+        # 1. Append the URN Identifier metadata element.
+        meta_body = {"metadata": {"Identifier": [{"vocabulary": "URN",
+                                                  "value": urn}]}}
+        r1 = requests.put(url, headers=self._headers(), json=meta_body,
+                          timeout=HTTP_TIMEOUT)
         self._pace()
-        self._require_ok(response, "Resource URN metadata update")
+        self._require_ok(r1, "Resource URN metadata update")
+        # 2. Set the custom_unique_identifier string field (own request).
+        cui_body = {"resource": {"custom_unique_identifier": urn},
+                    "custom_unique_identifier": urn}
+        r2 = requests.put(url, headers=self._headers(), json=cui_body,
+                          timeout=HTTP_TIMEOUT)
+        self._pace()
+        self._require_ok(r2, "Resource custom_unique_identifier update")
 
     # -- media files ------------------------------------------------------- #
 
@@ -1388,14 +1454,25 @@ def process_resource_directory(client, collection_id, resource_dir, args,
             print(f"    ERROR creating resource: {exc}")
             return counts
     counts["resource"] = 1
-    aviary_url = client.get_resource_direct_url(resource_id)
-    log_row["URL"] = aviary_url
+    resource_urls = client.get_resource_urls(resource_id)
+    log_row["URL"] = resource_urls.get("direct_url", "")
     print(f"    -> resource id: {resource_id}")
 
-    # Mint a persistent NRS URN that resolves to the Aviary URL (opt-in).
-    if args.mint_urns and aviary_url:
-        urn = mint_resource_urn(resource_user_key, aviary_url,
-                                args.urn_authority, args.dry_run)
+    # Mint a persistent NRS URN that resolves to the resource's persistent_url
+    # (opt-in).
+    persistent_url = resource_urls.get("persistent_url", "")
+    if args.mint_urns and persistent_url:
+        # Authority path comes from audio/video.properties (authorityPath) at
+        # the resource-dir root; --urn-authority is the fallback if absent.
+        authority_path = find_authority_path(resource_dir)
+        if authority_path:
+            print(f"    authorityPath: {authority_path}")
+        else:
+            authority_path = args.urn_authority
+            print(f"    authorityPath: not found in audio/video.properties; "
+                  f"using fallback {authority_path!r}")
+        urn = mint_resource_urn(resource_user_key, persistent_url,
+                                authority_path, args.dry_run)
         log_row["URN"] = urn
         if urn:
             print(f"    -> URN: {urn}")
@@ -1409,6 +1486,8 @@ def process_resource_directory(client, collection_id, resource_dir, args,
             except Exception as exc:
                 print(f"    WARNING: could not record URN metadata on resource "
                       f"{resource_id}: {exc}")
+    elif args.mint_urns and not persistent_url:
+        print("    WARNING: no persistent_url for resource; skipping URN mint")
 
     # Locate the deliverable directory for this resource.
     deliverable_dir = find_subdirectory(resource_dir, DELIVERABLE_DIR_NAME)
@@ -1592,8 +1671,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--urn-authority", default=os.environ.get(
             "DEFAULT_AUTHORITY_PATH", URN_AUTHORITY_PATH),
-        help="NRS authority path under which URNs are minted with --mint-urns "
-             f"(default {URN_AUTHORITY_PATH}; or set DEFAULT_AUTHORITY_PATH).")
+        help="Fallback NRS authority path for --mint-urns, used only when a "
+             "resource has no audio/video.properties 'authorityPath' at its "
+             f"root (default {URN_AUTHORITY_PATH}; or set "
+             "DEFAULT_AUTHORITY_PATH).")
     parser.add_argument(
         "--log-file", default="mps_aviary_import_log.csv",
         help="CSV log file; one row is appended per resource directory "
