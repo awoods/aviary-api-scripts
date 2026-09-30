@@ -39,7 +39,14 @@ Given a top-level directory (a single deposit, or a parent containing several):
      setting is then forced onto it. On any MARC failure it falls back to the
      metadata mapping above.
 4. **Uploads media** — every `.mp3` / `.mp4` / `.mov` under `deliverable/`,
-   sorted alphanumerically, via Aviary's presigned-upload flow.
+   sorted alphanumerically. By default each file is sent straight to Wasabi as
+   a **multipart (chunked) upload**: it is split into `--part-size-mb` chunks
+   (default 100 MB), each PUT to its own presigned URL and retried on its own,
+   and Aviary joins the parts when the upload is completed. This supports files
+   over 5 GB (up to 25 GB per file) and keeps memory use at about one chunk.
+   Empty (0-byte) files, and every file when `--no-multipart` is given, use the
+   single-PUT presigned upload instead (5 GB max per file); the script also
+   falls back to single PUT if the server doesn't return a multipart upload.
 5. **Creates indexes** — every `*playlist.xml` in `deliverable/playlists/`,
    each linked to the media file whose filename (without extension) matches the
    playlist's `<dc:identifier>` value. Indexes with no matching media file are
@@ -64,7 +71,8 @@ to the resource's metadata as an Identifier (vocabulary `URN`). See
 [Minting persistent URNs](#minting-persistent-urns-optional).
 
 The HTTP request patterns mirror AVP's own published bulk-import scripts
-(<https://github.com/WeAreAVP/aviary-api-scripts>).
+(<https://github.com/WeAreAVP/aviary-api-scripts>), except for the multipart
+media upload described in step 4.
 
 ## Requirements
 
@@ -110,6 +118,12 @@ uv run aviary_directory_import.py /path/to/top_level_directory --importMarc
 
 # Mint a persistent NRS URN for each resource (requires .env; see below):
 uv run aviary_directory_import.py /path/to/top_level_directory --mint-urns
+
+# Media uploads in chunks by default; change the chunk size (5–5120 MB):
+uv run aviary_directory_import.py /path/to/top_level_directory --part-size-mb 250
+
+# Force the single-request upload instead (5 GB max per file):
+uv run aviary_directory_import.py /path/to/top_level_directory --no-multipart
 ```
 
 Run `uv run aviary_directory_import.py --help` for all options.
@@ -128,7 +142,9 @@ Run `uv run aviary_directory_import.py --help` for all options.
 | `--base-url` | Force a specific API base URL (normally derived from `aviaryOrg`). |
 | `--wait` | Seconds to pause between API calls (default `1.0`) to respect rate limits. |
 | `--log-file` | CSV log file, one row per resource directory (default `mps_aviary_import_log.csv`). |
-| `--retry-attempts` / `--retry-backoff` | Attempts and exponential-backoff base for media uploads and index creation. |
+| `--part-size-mb` | Chunk size in MB for multipart media uploads, 5–5120 (default `100`). |
+| `--no-multipart` | Upload each media file with a single PUT (max 5 GB per file) instead of the multipart chunked upload. |
+| `--retry-attempts` / `--retry-backoff` | Attempts and exponential-backoff base for media uploads (per chunk, for multipart), upload completion, and index creation. |
 | `--media-ready-timeout` / `--media-ready-interval` | Bound the wait for media transcoding before attaching an index. |
 | `--marc-import-timeout` / `--marc-import-interval` | Bound the wait for a MARC XML import job to finish. |
 | `--resource-appear-timeout` | Bound the wait for a MARC-imported resource to appear in the collection. |
