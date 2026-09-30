@@ -51,10 +51,16 @@ What the script does
    import proceed. If ``--importMarc`` is not given, or ``alephID`` is NULL, or
    the MARC fetch/import fails, the project.prop metadata mapping above is used.
 5. Imports one Aviary media file for every ``.mp3`` / ``.mp4`` / ``.mov`` found
-   anywhere
-   under that resource's ``deliverable`` subdirectory, sorted alphanumerically
-   by filename. Each media file is created with
+   anywhere under that resource's ``deliverable`` subdirectory, sorted
+   alphanumerically by filename. Each media file is created with
        access = true, is_downloadable = false, is_360 = false.
+   Media is uploaded straight to Wasabi as a multipart (chunked)
+   upload. The file is sent in ``--part-size-mb`` chunks (default 100 MB),
+   each with its own presigned URL and its own retries, and Aviary joins the
+   parts when the upload is completed. This handles files over 5 GB (up to
+   25 GB per file) and keeps memory use at about one chunk. Empty (0-byte)
+   files, and every file when ``--no-multipart`` is given, use a single-PUT
+   upload instead (5 GB max per file).
 6. Imports one Aviary index for every ``*playlist.xml`` file found in the
    ``deliverable/playlists`` subdirectory. Each index is linked (via
    ``resource_file_id``) to the media file whose filename (without extension)
@@ -85,7 +91,8 @@ resource-directory root, falling back to ``--urn-authority`` (default
 ``HUL.TEST``) if neither file provides one.
 
 The HTTP request patterns (resource create, presigned media upload, index
-create) follow AVP's own published bulk-import script
+create) follow AVP's own published bulk-import script (except the media
+upload, which uses the multipart flow described in step 5)
 (https://github.com/WeAreAVP/aviary-api-scripts).
 
 The API base URL does NOT need to be supplied: it is derived automatically
@@ -106,6 +113,13 @@ Usage
     # column, and add it to the resource metadata (Identifier / "URN").
     # Requires the urn-minter library and NRS credentials in a .env file.
     python3 aviary_directory_import.py /path/to/dir --mint-urns
+
+    # Media uploads in chunks by default (handles files over 5 GB, up to
+    # 25 GB); set the chunk size in MB (5-5120, default 100) if needed.
+    python3 aviary_directory_import.py /path/to/dir --part-size-mb 250
+
+    # Force the old single-request upload (5 GB max per file).
+    python3 aviary_directory_import.py /path/to/dir --no-multipart
 
     # Preview the planned API calls without contacting Aviary.
     python3 aviary_directory_import.py /path/to/dir --dry-run
@@ -161,8 +175,19 @@ WAIT_SECONDS = 1.0
 # index file). The large media PUT to presigned storage uses NO client-side
 # timeout (matching AVP's bulk-import script), since a read timeout was cutting
 # off multi-GB transfers mid-upload.
+# Each multipart media chunk (<= --part-size-mb) is sent with UPLOAD_TIMEOUT,
+# which allows up to an hour for each chunk.
 HTTP_TIMEOUT = (30, 300)
 UPLOAD_TIMEOUT = (30, 3600)
+
+# Multipart (chunked) media upload. Each file is split into
+# MULTIPART_PART_SIZE chunks, and each chunk is PUT straight to Wasabi with its
+# own presigned URL. Aviary accepts part sizes from 5 MB to 5 GB (100 MB by
+# default) and files up to 25 GB. Override with --part-size-mb, or use
+# --no-multipart for the old single-PUT upload.
+MULTIPART_PART_SIZE = 100 * 1024 * 1024
+MULTIPART_MIN_PART_SIZE = 5 * 1024 * 1024
+MULTIPART_MAX_PART_SIZE = 5 * 1024 * 1024 * 1024
 
 # Retry/backoff for media and index creation (transient network/server errors).
 RETRY_ATTEMPTS = 3       # total attempts per operation
@@ -618,7 +643,8 @@ def find_authority_path(resource_dir):
 class AviaryClient:
     def __init__(self, base_url, token, organization_id, wait=WAIT_SECONDS,
                  dry_run=False, retry_attempts=RETRY_ATTEMPTS,
-                 retry_backoff=RETRY_BACKOFF):
+                 retry_backoff=RETRY_BACKOFF, multipart=True,
+                 part_size=MULTIPART_PART_SIZE):
         # Guarantee exactly one trailing slash on the base URL.
         self.base_url = base_url.rstrip("/") + "/"
         self.token = token
@@ -629,6 +655,9 @@ class AviaryClient:
         self.dry_run = dry_run
         self.retry_attempts = max(1, int(retry_attempts))
         self.retry_backoff = retry_backoff
+        # Multipart media upload settings (see upload_media_file).
+        self.multipart = multipart
+        self.part_size = int(part_size)
 
     # -- helpers ----------------------------------------------------------- #
 
@@ -909,16 +938,32 @@ class AviaryClient:
     def upload_media_file(self, file_path, resource_id, sort_order):
         """Upload a local media file via the presigned-URL flow.
 
-        Returns the new media file id. Mirrors AVP's upload_from_path():
-          1. POST media_files with media_file='presigned' -> presigned_url + id
-          2. PUT the file bytes to the presigned URL
-          3. GET media_files/{id}/complete
+        Returns the new media file id.
+
+        Uses Aviary's multipart (chunked) presigned upload:
+          1. POST media_files with media_file='presigned', multipart=true and
+             file_size -> media id + multipart_upload (upload_id, part_size,
+             parts_count, and one presigned PUT url per part)
+          2. PUT each part_size chunk of the file straight to Wasabi at its
+             part url (each chunk is retried on its own if it fails)
+          3. GET media_files/{id}/complete?upload_id=...&parts_count=... --
+             Aviary joins the parts into the final file on Wasabi and starts
+             processing.
+        The file is read one chunk at a time, so memory use stays at about one
+        part_size no matter how big the file is, and files over 5 GB (the
+        single-PUT limit) upload fine. The single-PUT flow is used instead
+        when --no-multipart is set, when the file is empty (Aviary needs a
+        file_size above 0 for multipart), or when the server returns no
+        multipart_upload (an Aviary release without multipart support).
         Per the task, every media file is access=true, is_downloadable=false,
         is_360=false.
         """
         url = self._url("api/v1/media_files")
         filename = os.path.basename(file_path)
         display_name = media_display_name(file_path)
+        # The server needs the exact byte size to work out the parts.
+        file_size = os.path.getsize(os.path.abspath(file_path))
+        multipart = self.multipart and file_size > 0
         params = {
             "collection_resource_id": resource_id,
             "access": "true",
@@ -930,10 +975,17 @@ class AviaryClient:
             "sort_order": sort_order,
             "thumbnail_path": "",
         }
+        # Ask for a multipart upload (see MULTIPART_* constants).
+        if multipart:
+            params["multipart"] = "true"
+            params["file_size"] = file_size
+            params["part_size"] = self.part_size
         if self.dry_run:
+            mode = (f"multipart part_size={self.part_size}" if multipart
+                    else "single PUT")
             print(f"    [dry-run] POST {url}  "
                   f"file={filename!r} display_name={display_name!r} "
-                  f"sort_order={sort_order} "
+                  f"sort_order={sort_order} size={file_size} ({mode}) "
                   f"access=true is_downloadable=false is_360=false")
             return f"DRY-RUN-MEDIA-ID-{sort_order}"
 
@@ -945,33 +997,102 @@ class AviaryClient:
         self._pace()
         payload = self._require_ok(response, "Media create")
         try:
-            presigned_url = payload["data"]["presigned_url"]
-            media_id = payload["data"]["id"]
+            data = payload["data"]
+            media_id = data["id"]
         except (KeyError, TypeError):
             raise RuntimeError(f"Unexpected media create response: {payload}")
 
-        # Step 2: PUT the bytes to the presigned (storage) URL using the same
-        # method as AVP's bulk-import script: the whole file in memory, the
-        # bearer auth header with Content-Type "text/plain", and NO client-side
-        # timeout. A read timeout was cutting off large (multi-GB) uploads
-        # mid-transfer; the official script omits the timeout and succeeds.
-        with open(os.path.abspath(file_path), "rb") as fh:
-            file_data = fh.read()
-        size_mb = len(file_data) / (1024 * 1024)
-        print(f"        uploading {filename} ({size_mb:.1f} MB)...")
-        upload_headers = {
-            "Authorization": f"Bearer {self.token}",
-            "Content-Type": "text/plain",
-        }
-        put_resp = requests.put(presigned_url, headers=upload_headers,
-                                data=file_data)
-        put_resp.raise_for_status()
+        size_mb = file_size / (1024 * 1024)
+        # multipart_upload is only in the response when the server started a
+        # multipart upload.
+        multipart_upload = data.get("multipart_upload")
+        if multipart_upload:
+            print(f"        uploading {filename} ({size_mb:.1f} MB) in "
+                  f"{multipart_upload['parts_count']} part(s)...")
+            self._upload_parts(file_path, multipart_upload)
+            complete_params = {
+                "upload_id": multipart_upload["upload_id"],
+                "parts_count": multipart_upload["parts_count"],
+            }
+        else:
+            if "presigned_url" not in data:
+                raise RuntimeError(
+                    f"Unexpected media create response: {payload}")
+            if multipart:
+                print("        server returned no multipart_upload; "
+                      "falling back to a single PUT")
+            print(f"        uploading {filename} ({size_mb:.1f} MB)...")
+            self._upload_single(file_path, data["presigned_url"])
+            complete_params = {}
 
         # Step 3: tell Aviary the upload is complete.
+        # The response is checked, and a failed complete is retried by itself.
+        # The parts are already on Wasabi, so the upload is not repeated and no
+        # second media record is created.
         complete_url = self._url(f"api/v1/media_files/{media_id}/complete")
-        requests.get(complete_url, headers=self._headers(), timeout=HTTP_TIMEOUT)
+        attempts = []
+
+        def _complete():
+            attempts.append(1)
+            resp = requests.get(complete_url, headers=self._headers(),
+                                params=complete_params, timeout=HTTP_TIMEOUT)
+            payload = self._safe_json(resp)
+            errors = payload.get("errors") if isinstance(payload, dict) else None
+            # If an earlier attempt joined the parts but its response was lost,
+            # Aviary no longer knows the upload_id. The file is already joined
+            # and processing, so treat that as done instead of failing (which
+            # would make the caller upload the whole file again).
+            if (len(attempts) > 1 and complete_params and errors
+                    and "already completed" in str(errors)):
+                print(f"        upload of {filename} was already completed")
+                return
+            self._require_ok(resp, "Media complete")
+
+        self._with_retries(f"media complete '{filename}'", _complete)
         self._pace()
         return media_id
+
+    def _upload_single(self, file_path, presigned_url):
+        """Legacy flow: PUT the whole file to one presigned URL (max 5 GB).
+
+        The file is streamed from disk instead of read fully into memory. The
+        Aviary bearer token is not sent: Wasabi does not need it, since the
+        presigned URL carries its own signature, and sending it would leak the
+        Aviary API key to a third party. There is no read timeout, so multi-GB
+        transfers are not cut off mid-upload.
+        """
+        with open(os.path.abspath(file_path), "rb") as fh:
+            put_resp = requests.put(presigned_url, data=fh)
+        put_resp.raise_for_status()
+
+    def _upload_parts(self, file_path, multipart_upload):
+        """Upload each chunk of the file to its presigned part URL.
+
+        Part N is the bytes [(N-1) * part_size, N * part_size) of the file;
+        the last part can be smaller. Each part is retried on its own, so a
+        network error never restarts the whole file. The part URLs are valid
+        for multipart_upload['expires_in'] seconds (12 hours by default).
+        """
+        part_size = int(multipart_upload["part_size"])
+        parts = sorted(multipart_upload["parts"],
+                       key=lambda p: int(p["part_number"]))
+        with open(os.path.abspath(file_path), "rb") as fh:
+            for part in parts:
+                number = int(part["part_number"])
+
+                def _put_part(number=number, part_url=part["url"]):
+                    fh.seek((number - 1) * part_size)
+                    chunk = fh.read(part_size)
+                    # No Authorization header: the part URL is presigned.
+                    resp = requests.put(part_url, data=chunk,
+                                        timeout=UPLOAD_TIMEOUT)
+                    if not (200 <= resp.status_code < 300):
+                        raise RuntimeError(
+                            f"part {number} upload failed: HTTP "
+                            f"{resp.status_code}: {resp.text[:300]}")
+
+                self._with_retries(f"part {number}/{len(parts)}", _put_part)
+                print(f"          part {number}/{len(parts)} uploaded")
 
     def get_media_file(self, media_id):
         """GET a media file record (used to check processing status)."""
@@ -1656,6 +1777,16 @@ def parse_args(argv=None):
         "--retry-backoff", type=float, default=RETRY_BACKOFF,
         help="Base seconds for exponential backoff between retries "
              f"(default {RETRY_BACKOFF}).")
+    # Options for the multipart (chunked) media upload.
+    parser.add_argument(
+        "--part-size-mb", type=float,
+        default=MULTIPART_PART_SIZE / (1024 * 1024),
+        help="Chunk size in MB for multipart media uploads, between 5 and "
+             f"5120 (default {MULTIPART_PART_SIZE // (1024 * 1024)}).")
+    parser.add_argument(
+        "--no-multipart", action="store_true",
+        help="Upload each media file with a single PUT (old flow, max 5 GB "
+             "per file) instead of the multipart chunked upload.")
     parser.add_argument(
         "--importMarc", dest="import_marc", action="store_true",
         help="Build each resource from its Harvard HOLLIS MARC XML record when "
@@ -1695,6 +1826,11 @@ def main(argv=None):
     if not args.dry_run and not args.token:
         sys.exit("ERROR: --token (or AVIARY_TOKEN) is required.")
 
+    # Validate the chunk size before any API call is made.
+    part_size = int(args.part_size_mb * 1024 * 1024)
+    if not MULTIPART_MIN_PART_SIZE <= part_size <= MULTIPART_MAX_PART_SIZE:
+        sys.exit("ERROR: --part-size-mb must be between 5 and 5120.")
+
     if args.mint_urns and not _URN_MINTER_AVAILABLE:
         sys.exit("ERROR: --mint-urns requires the 'urn-minter' library "
                  "(install urn-minter>=1.0.1 from the HUIT Artifactory "
@@ -1732,6 +1868,9 @@ def main(argv=None):
         dry_run=args.dry_run,
         retry_attempts=args.retry_attempts,
         retry_backoff=args.retry_backoff,
+        # Multipart media upload settings.
+        multipart=not args.no_multipart,
+        part_size=part_size,
     )
 
     print("\n--- Resolving collection ---")
