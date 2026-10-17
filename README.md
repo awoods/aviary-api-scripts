@@ -134,7 +134,7 @@ Run `uv run aviary_directory_import.py --help` for all options.
 | --- | --- |
 | `--dry-run` | Scan and print the planned API calls without contacting Aviary. |
 | `--importMarc` | Build resources from Harvard HOLLIS MARC XML when a usable `alephID` is present (default: always use the `project.prop` metadata mapping). |
-| `--mint-urns` | Mint a persistent NRS URN per resource, record it in the log's `URN` column, and add it to the resource metadata as an Identifier (requires `urn-minter` + NRS credentials; see below). |
+| `--mint-urns` | Mint a persistent NRS URN per resource, record it in the log's `URN` column, set it as the resource's `custom_unique_identifier`, and add it to the resource metadata as an Identifier (requires `urn-minter` + NRS credentials; see below). |
 | `--urn-authority` | NRS authority path for `--mint-urns` (default `HUL.TEST`; or set `DEFAULT_AUTHORITY_PATH`). |
 | `--token` | API token (defaults to `AVIARY_TOKEN`). |
 | `--collection-title` | Override the default `MPS Upload <today>` collection title. |
@@ -152,8 +152,12 @@ Run `uv run aviary_directory_import.py --help` for all options.
 ## Minting persistent URNs (optional)
 
 With `--mint-urns`, each created resource also gets a persistent NRS URN that
-resolves to its Aviary URL, recorded in the log's `URN` column and added to the
-resource's metadata as an Identifier (vocabulary `URN`). This uses the
+resolves to its Aviary URL, recorded in the log's `URN` column, set as the
+resource's `custom_unique_identifier`, and added to the resource's metadata as
+an Identifier (vocabulary `URN`). The two resource updates are sent as separate
+requests, so a failure of one does not undo the other. Aviary requires
+`custom_unique_identifier` to be unique within the organization; a duplicate
+value is rejected and leaves the field unchanged. This uses the
 `urn-minter` library (installed via `uv sync`) and requires NRS credentials in a
 `.env` file in the working directory, which `pydantic-settings` loads
 automatically.

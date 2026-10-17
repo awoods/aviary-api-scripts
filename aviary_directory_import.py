@@ -899,24 +899,21 @@ class AviaryClient:
     def add_resource_urn_metadata(self, resource_id, urn):
         """Record the URN on a resource via PUT /api/v1/resources/{id}.
 
-        Two separate PUTs (kept separate because a combined request applied only
-        the metadata and dropped the custom_unique_identifier):
+        Two separate PUTs so a failure of one does not undo the other:
           1. metadata -- append an Identifier element (vocabulary "URN") using
              the create-style shape {FieldLabel: [{"vocabulary":..,"value":..}]}.
              This APPENDS to existing Identifier metadata, so only the new URN
              element is sent (re-sending existing entries would duplicate them).
-          2. custom_unique_identifier -- set the top-level string field to the
-             URN. It is sent nested under "resource" (and also top-level) so it
-             lands in the update's resource params; the documented PUT body only
-             lists title/access/is_featured/metadata, so a bare top-level
-             custom_unique_identifier was being dropped.
+          2. custom_unique_identifier -- set the resource's custom unique
+             identifier to the URN. The update endpoint accepts this as a
+             top-level field; it must be unique within the organization (a
+             duplicate value returns an error and applies no change).
         """
         url = self._url(f"api/v1/resources/{resource_id}")
         if self.dry_run:
             print(f"      [dry-run] PUT {url}  metadata.Identifier += "
                   f"{{vocabulary: 'URN', value: {urn!r}}}")
-            print(f"      [dry-run] PUT {url}  "
-                  f"resource.custom_unique_identifier={urn!r}")
+            print(f"      [dry-run] PUT {url}  custom_unique_identifier={urn!r}")
             return
         # 1. Append the URN Identifier metadata element.
         meta_body = {"metadata": {"Identifier": [{"vocabulary": "URN",
@@ -926,8 +923,7 @@ class AviaryClient:
         self._pace()
         self._require_ok(r1, "Resource URN metadata update")
         # 2. Set the custom_unique_identifier string field (own request).
-        cui_body = {"resource": {"custom_unique_identifier": urn},
-                    "custom_unique_identifier": urn}
+        cui_body = {"custom_unique_identifier": urn}
         r2 = requests.put(url, headers=self._headers(), json=cui_body,
                           timeout=HTTP_TIMEOUT)
         self._pace()
